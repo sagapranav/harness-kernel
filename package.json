@@ -1,0 +1,80 @@
+{
+  "name": "@sagapranav/harness-kernel",
+  "version": "0.1.0",
+  "description": "Provider-neutral, append-only primitives for building durable agent harnesses.",
+  "type": "module",
+  "license": "MIT",
+  "sideEffects": false,
+  "engines": {
+    "node": ">=20"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/src/index.d.ts",
+      "import": "./dist/src/index.js"
+    },
+    "./protocol": {
+      "types": "./dist/src/protocol.d.ts",
+      "import": "./dist/src/protocol.js"
+    },
+    "./journal": {
+      "types": "./dist/src/journal.d.ts",
+      "import": "./dist/src/journal.js"
+    },
+    "./artifacts": {
+      "types": "./dist/src/artifacts.d.ts",
+      "import": "./dist/src/artifacts.js"
+    },
+    "./projection": {
+      "types": "./dist/src/projection.d.ts",
+      "import": "./dist/src/projection.js"
+    },
+    "./providers": {
+      "types": "./dist/src/providers.d.ts",
+      "import": "./dist/src/providers.js"
+    },
+    "./loop": {
+      "types": "./dist/src/loop.d.ts",
+      "import": "./dist/src/loop.js"
+    },
+    "./sessions": {
+      "types": "./dist/src/sessions.d.ts",
+      "import": "./dist/src/sessions.js"
+    }
+  },
+  "files": [
+    "dist/src",
+    "docs",
+    "examples",
+    "AGENTS.md",
+    "ARCHITECTURE.md",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test dist/test/*.test.js",
+    "check": "npm run typecheck && npm test",
+    "pack:check": "npm pack --dry-run",
+    "prepare": "npm run build"
+  },
+  "devDependencies": {
+    "@types/node": "^25.0.0",
+    "typescript": "^6.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sagapranav/harness-kernel.git"
+  },
+  "keywords": [
+    "agents",
+    "ai",
+    "event-log",
+    "harness",
+    "llm",
+    "openai",
+    "anthropic",
+    "tool-use"
+  ]
+}
