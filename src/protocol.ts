@@ -17,47 +17,55 @@ export interface ArtifactRef {
 }
 
 export interface TextBlock {
-  type: 'text';
+  type: "text";
   text: string;
+  providerMetadata?: Metadata;
 }
 
 export interface ImageBlock {
-  type: 'image';
+  type: "image";
   artifact: ArtifactRef;
   alt?: string;
+  providerMetadata?: Metadata;
 }
 
 export interface FileBlock {
-  type: 'file';
+  type: "file";
   artifact: ArtifactRef;
+  providerMetadata?: Metadata;
 }
 
 export interface ToolCallBlock {
-  type: 'tool_call';
+  type: "tool_call";
   id: string;
   name: string;
   input: unknown;
+  inputParseError?: string;
+  providerMetadata?: Metadata;
 }
 
 export interface ToolResultBlock {
-  type: 'tool_result';
+  type: "tool_result";
   toolCallId: string;
   name?: string;
   isError: boolean;
   content: ContentBlock[];
+  providerMetadata?: Metadata;
 }
 
 export interface ReasoningBlock {
-  type: 'reasoning';
+  type: "reasoning";
   text?: string;
   redacted?: boolean;
   signature?: string;
+  providerMetadata?: Metadata;
 }
 
 export interface ProviderBlock {
-  type: 'provider';
+  type: "provider";
   provider: string;
   providerType: string;
+  placement?: "content" | "item";
   raw?: unknown;
   rawArtifact?: ArtifactRef;
 }
@@ -71,7 +79,7 @@ export type ContentBlock =
   | ReasoningBlock
   | ProviderBlock;
 
-export type MessageRole = 'system' | 'user' | 'assistant' | 'tool';
+export type MessageRole = "system" | "user" | "assistant" | "tool";
 
 export interface CanonicalMessage {
   id: string;
@@ -116,13 +124,14 @@ export interface TokenUsage {
 }
 
 export type ModelStopReason =
-  | 'end'
-  | 'tool_use'
-  | 'length'
-  | 'content_filter'
-  | 'error'
-  | 'aborted'
-  | 'unknown';
+  | "end"
+  | "tool_use"
+  | "length"
+  | "content_filter"
+  | "pause"
+  | "error"
+  | "aborted"
+  | "unknown";
 
 export interface ModelTelemetry {
   provider: string;
@@ -140,9 +149,15 @@ export interface ModelTelemetry {
 export interface NormalizedModelResponse {
   message: CanonicalMessage;
   telemetry: ModelTelemetry;
+  /** Exact provider response, inline or offloaded, for lossless audit/replay. */
+  providerSnapshot?: {
+    provider: string;
+    raw?: unknown;
+    rawArtifact?: ArtifactRef;
+  };
 }
 
-export type EventCategory = 'context' | 'trace' | 'control';
+export type EventCategory = "context" | "trace" | "control";
 
 /**
  * The envelope is deliberately open on `type` and `data`. Readers must retain
@@ -181,7 +196,7 @@ export interface ActionInvocation {
   expectedPostcondition?: string;
 }
 
-export type ActionStatus = 'succeeded' | 'failed' | 'pending' | 'unknown';
+export type ActionStatus = "succeeded" | "failed" | "pending" | "unknown";
 
 export interface ActionReceipt {
   invocationId: string;
@@ -196,7 +211,7 @@ export interface ActionReceipt {
 export interface EvidenceClaim {
   claimId: string;
   text: string;
-  status: 'unverified' | 'verified' | 'refuted';
+  status: "unverified" | "verified" | "refuted";
   evidenceRefs: ArtifactRef[];
   verifiedAt?: string;
   verifier?: string;
@@ -214,7 +229,7 @@ export interface SessionDescriptor {
 
 export interface ChildResult {
   childSessionId: string;
-  status: 'completed' | 'failed' | 'cancelled';
+  status: "completed" | "failed" | "cancelled";
   conclusion?: string;
   noneFound?: boolean;
   confidence?: number;
@@ -240,14 +255,14 @@ export interface ContextCompaction {
    * `including_inherited` lets a child compact the parent projection it
    * inherited as well as its own local events.
    */
-  scope: 'local' | 'including_inherited';
+  scope: "local" | "including_inherited";
   projectorVersion: number;
   model?: ProviderRef;
 }
 
 export type LoopOutcome =
-  | { status: 'completed'; turns: number }
-  | { status: 'checkpointed'; turns: number; reason: string }
-  | { status: 'failed'; turns: number; error: string }
-  | { status: 'cancelled'; turns: number }
-  | { status: 'limited'; turns: number; limit: number };
+  | { status: "completed"; turns: number }
+  | { status: "checkpointed"; turns: number; reason: string }
+  | { status: "failed"; turns: number; error: string }
+  | { status: "cancelled"; turns: number }
+  | { status: "limited"; turns: number; limit: number };

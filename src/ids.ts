@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { randomUUID } from "node:crypto";
 
 /** Generates an opaque identifier. Consumers may replace it at every boundary. */
 export function createId(prefix?: string): string {

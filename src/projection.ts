@@ -1,6 +1,9 @@
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
-import { createId } from './ids.js';
+import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
+import { createId } from "./ids.js";
+import { validateChain } from "./journal.js";
+import { assertJsonSerializable, cloneJson } from "./json.js";
+import { storageKey } from "./storage.js";
 import type {
   AppendEventInput,
   ArtifactRef,
@@ -8,30 +11,36 @@ import type {
   ContextCompaction,
   ContextProjection,
   JournalEvent,
-} from './protocol.js';
+} from "./protocol.js";
 
 export const EVENT_TYPES = {
-  sessionStarted: 'session.started',
-  messageAppended: 'message.appended',
-  contextCompacted: 'context.compacted',
-  modelCallStarted: 'model.call.started',
-  modelCallCompleted: 'model.call.completed',
-  actionStarted: 'action.started',
-  actionCompleted: 'action.completed',
-  childStarted: 'child.started',
-  childCompleted: 'child.completed',
-  runCompleted: 'run.completed',
+  sessionStarted: "session.started",
+  messageAppended: "message.appended",
+  contextCompacted: "context.compacted",
+  modelCallStarted: "model.call.started",
+  modelCallCompleted: "model.call.completed",
+  modelProtocolError: "model.protocol.error",
+  actionStarted: "action.started",
+  actionCompleted: "action.completed",
+  childStarted: "child.started",
+  childCompleted: "child.completed",
+  runCompleted: "run.completed",
 } as const;
 
 function dataRecord(event: JournalEvent): Record<string, unknown> {
-  if (typeof event.data !== 'object' || event.data === null || Array.isArray(event.data)) return {};
+  if (
+    typeof event.data !== "object" ||
+    event.data === null ||
+    Array.isArray(event.data)
+  )
+    return {};
   return event.data as Record<string, unknown>;
 }
 
 function eventMessage(event: JournalEvent): CanonicalMessage | null {
   if (!event.affectsContext) return null;
   const message = dataRecord(event).message;
-  if (typeof message !== 'object' || message === null) return null;
+  if (typeof message !== "object" || message === null) return null;
   return message as CanonicalMessage;
 }
 
@@ -39,25 +48,40 @@ function compactionData(event: JournalEvent): ContextCompaction | null {
   if (event.type !== EVENT_TYPES.contextCompacted) return null;
   const data = dataRecord(event);
   if (
-    typeof data.summarizesThroughEventId !== 'string' ||
-    typeof data.summary !== 'object' ||
-    data.summary === null
+    typeof data.summarizesThroughEventId !== "string" ||
+    !isCanonicalMessage(data.summary) ||
+    !Array.isArray(data.evidenceRefs) ||
+    (data.scope !== "local" && data.scope !== "including_inherited") ||
+    !Number.isSafeInteger(data.projectorVersion) ||
+    (data.projectorVersion as number) < 1
   ) {
     return null;
   }
   return data as unknown as ContextCompaction;
 }
 
+function isCanonicalMessage(value: unknown): value is CanonicalMessage {
+  if (typeof value !== "object" || value === null || Array.isArray(value))
+    return false;
+  const message = value as Partial<CanonicalMessage>;
+  return (
+    typeof message.id === "string" &&
+    ["system", "user", "assistant", "tool"].includes(message.role ?? "") &&
+    Array.isArray(message.content) &&
+    typeof message.createdAt === "string"
+  );
+}
+
 function artifactRefs(value: unknown): ArtifactRef[] {
   if (!Array.isArray(value)) return [];
   return value.filter((candidate): candidate is ArtifactRef => {
-    if (typeof candidate !== 'object' || candidate === null) return false;
+    if (typeof candidate !== "object" || candidate === null) return false;
     const ref = candidate as Partial<ArtifactRef>;
     return (
-      typeof ref.sha256 === 'string' &&
-      typeof ref.uri === 'string' &&
-      typeof ref.bytes === 'number' &&
-      typeof ref.mediaType === 'string'
+      typeof ref.sha256 === "string" &&
+      typeof ref.uri === "string" &&
+      typeof ref.bytes === "number" &&
+      typeof ref.mediaType === "string"
     );
   });
 }
@@ -65,11 +89,11 @@ function artifactRefs(value: unknown): ArtifactRef[] {
 function eventEvidenceRefs(event: JournalEvent): ArtifactRef[] {
   const data = dataRecord(event);
   const message =
-    typeof data.message === 'object' && data.message !== null
+    typeof data.message === "object" && data.message !== null
       ? (data.message as CanonicalMessage)
       : undefined;
   const result =
-    typeof data.result === 'object' && data.result !== null
+    typeof data.result === "object" && data.result !== null
       ? (data.result as Record<string, unknown>)
       : {};
   return [
@@ -94,10 +118,15 @@ export function projectContext(
   events: JournalEvent[],
   options: ProjectContextOptions = {},
 ): ContextProjection {
+  validateChain(sessionId, events);
   let latest:
     | { event: JournalEvent; data: ContextCompaction; boundaryIndex: number }
     | undefined;
-  for (let compactionIndex = events.length - 1; compactionIndex >= 0; compactionIndex -= 1) {
+  for (
+    let compactionIndex = events.length - 1;
+    compactionIndex >= 0;
+    compactionIndex -= 1
+  ) {
     const event = events[compactionIndex]!;
     const data = compactionData(event);
     if (data === null) continue;
@@ -117,10 +146,10 @@ export function projectContext(
 
   if (latest !== undefined) {
     localStart = latest.boundaryIndex + 1;
-    if (latest.data.scope === 'including_inherited') messages = [];
+    if (latest.data.scope === "including_inherited") messages = [];
     messages.push(latest.data.summary);
     evidenceRefs = [
-      ...(latest.data.scope === 'including_inherited'
+      ...(latest.data.scope === "including_inherited"
         ? []
         : (options.inheritedEvidenceRefs ?? [])),
       ...latest.data.evidenceRefs,
@@ -151,7 +180,7 @@ export function messageEvent(
   turnId: string | null = null,
 ): AppendEventInput<{ message: CanonicalMessage }> {
   return {
-    category: 'context',
+    category: "context",
     type: EVENT_TYPES.messageAppended,
     affectsContext: true,
     turnId,
@@ -164,7 +193,7 @@ export function compactionEvent(
   turnId: string | null = null,
 ): AppendEventInput<ContextCompaction> {
   return {
-    category: 'context',
+    category: "context",
     type: EVENT_TYPES.contextCompacted,
     affectsContext: true,
     turnId,
@@ -204,11 +233,48 @@ export function foldProjection<TState>(
       prior.version !== definition.version ||
       prior.sessionId !== sessionId)
   ) {
-    throw new Error('projection snapshot does not match its definition or session');
+    throw new Error(
+      "projection snapshot does not match its definition or session",
+    );
+  }
+  if (prior !== undefined) {
+    if (
+      !Number.isSafeInteger(prior.throughSequence) ||
+      prior.throughSequence < 0 ||
+      (prior.throughSequence === 0
+        ? prior.throughEventId !== null
+        : typeof prior.throughEventId !== "string" ||
+          prior.throughEventId.length === 0)
+    ) {
+      throw new Error("projection snapshot has an invalid journal boundary");
+    }
+    if (events[0]?.sequence === 1) {
+      validateChain(sessionId, events);
+      const boundary =
+        prior.throughSequence === 0
+          ? undefined
+          : events[prior.throughSequence - 1];
+      if (
+        prior.throughSequence > 0 &&
+        (boundary?.sequence !== prior.throughSequence ||
+          boundary.id !== prior.throughEventId)
+      ) {
+        throw new Error("projection snapshot does not match the raw journal");
+      }
+    } else {
+      validateChain(sessionId, events, {
+        parentId: prior.throughEventId,
+        startingSequence: prior.throughSequence + 1,
+      });
+    }
+  } else {
+    validateChain(sessionId, events);
   }
 
-  let state = prior?.state ?? definition.initial();
-  const remaining = events.filter((event) => event.sequence > (prior?.throughSequence ?? 0));
+  let state = cloneJson(prior?.state ?? definition.initial());
+  const remaining = events.filter(
+    (event) => event.sequence > (prior?.throughSequence ?? 0),
+  );
   for (const event of remaining) state = definition.reduce(state, event);
   const head = remaining.at(-1);
   return {
@@ -240,26 +306,69 @@ export class FileProjectionStore implements ProjectionStore {
     version: number,
   ): Promise<ProjectionSnapshot<TState> | null> {
     try {
-      return JSON.parse(await readFile(this.path(sessionId, name, version), 'utf8')) as ProjectionSnapshot<TState>;
+      const snapshot = JSON.parse(
+        await readFile(this.path(sessionId, name, version), "utf8"),
+      ) as ProjectionSnapshot<TState>;
+      if (
+        snapshot.sessionId !== sessionId ||
+        snapshot.name !== name ||
+        snapshot.version !== version ||
+        !Number.isSafeInteger(snapshot.throughSequence) ||
+        snapshot.throughSequence < 0 ||
+        (snapshot.throughSequence === 0
+          ? snapshot.throughEventId !== null
+          : typeof snapshot.throughEventId !== "string" ||
+            snapshot.throughEventId.length === 0)
+      ) {
+        throw new Error(
+          `projection snapshot identity mismatch: ${this.path(sessionId, name, version)}`,
+        );
+      }
+      return snapshot;
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
       throw error;
     }
   }
 
   async save<TState>(snapshot: ProjectionSnapshot<TState>): Promise<void> {
-    const path = this.path(snapshot.sessionId, snapshot.name, snapshot.version);
+    assertJsonSerializable(snapshot);
+    if (
+      !Number.isSafeInteger(snapshot.throughSequence) ||
+      snapshot.throughSequence < 0 ||
+      (snapshot.throughSequence === 0
+        ? snapshot.throughEventId !== null
+        : typeof snapshot.throughEventId !== "string" ||
+          snapshot.throughEventId.length === 0)
+    ) {
+      throw new TypeError("projection snapshot boundary is invalid");
+    }
+    const stableSnapshot = cloneJson(snapshot);
+    const path = this.path(
+      stableSnapshot.sessionId,
+      stableSnapshot.name,
+      stableSnapshot.version,
+    );
     await mkdir(dirname(path), { recursive: true });
-    const temporary = `${path}.${createId('projection')}.tmp`;
-    await writeFile(temporary, `${JSON.stringify(snapshot, null, 2)}\n`, { flag: 'wx' });
-    await rename(temporary, path);
+    const temporary = `${path}.${createId("projection")}.tmp`;
+    await writeFile(temporary, `${JSON.stringify(stableSnapshot, null, 2)}\n`, {
+      flag: "wx",
+    });
+    try {
+      await rename(temporary, path);
+    } finally {
+      await unlink(temporary).catch(() => undefined);
+    }
   }
 
   private path(sessionId: string, name: string, version: number): string {
+    if (!Number.isSafeInteger(version) || version < 1) {
+      throw new TypeError("projection version must be a positive safe integer");
+    }
     return join(
       this.rootDirectory,
-      encodeURIComponent(sessionId),
-      `${encodeURIComponent(name)}-v${version}.json`,
+      storageKey(sessionId, "session id"),
+      `${storageKey(name, "projection name")}-v${version}.json`,
     );
   }
 }

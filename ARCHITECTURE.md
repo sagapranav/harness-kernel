@@ -37,6 +37,7 @@ concerns.
 
 Large, binary, repeated, or provider-native payloads belong in an
 `ArtifactStore`. Events carry immutable SHA-256 references.
+Filesystem reads re-check digest and byte count so corruption fails loudly.
 
 ### Projections
 
@@ -102,6 +103,9 @@ contract changes incompatibly.
 Do not add provider-specific fields to canonical messages unless the semantics
 are genuinely shared. Use a provider adapter and a `provider` block or artifact
 reference instead.
+
+Provider encoders must either encode a block or throw. Silent omission creates
+a false transcript and is never an acceptable compatibility strategy.
 
 ## Non-goals
 

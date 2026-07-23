@@ -25,6 +25,10 @@
       "types": "./dist/src/artifacts.d.ts",
       "import": "./dist/src/artifacts.js"
     },
+    "./json": {
+      "types": "./dist/src/json.d.ts",
+      "import": "./dist/src/json.js"
+    },
     "./projection": {
       "types": "./dist/src/projection.d.ts",
       "import": "./dist/src/projection.js"
@@ -40,10 +44,16 @@
     "./sessions": {
       "types": "./dist/src/sessions.d.ts",
       "import": "./dist/src/sessions.js"
+    },
+    "./telemetry": {
+      "types": "./dist/src/telemetry.d.ts",
+      "import": "./dist/src/telemetry.js"
     }
   },
   "files": [
+    "src",
     "dist/src",
+    "dist/examples",
     "docs",
     "examples",
     "AGENTS.md",
@@ -55,12 +65,15 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "npm run build && node --test dist/test/*.test.js",
-    "check": "npm run typecheck && npm test",
-    "pack:check": "npm pack --dry-run",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "check": "npm run typecheck && npm test && npm run format:check",
+    "pack:check": "npm pack --dry-run --cache .npm-cache",
     "prepare": "npm run build"
   },
   "devDependencies": {
     "@types/node": "^25.0.0",
+    "prettier": "^3.9.6",
     "typescript": "^6.0.0"
   },
   "repository": {

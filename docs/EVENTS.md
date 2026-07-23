@@ -9,7 +9,7 @@ interface JournalEvent<TData> {
   sequence: number;
   parentId: string | null;
   timestamp: string;
-  category: 'context' | 'trace' | 'control';
+  category: "context" | "trace" | "control";
   type: string;
   version: number;
   turnId: string | null;
@@ -23,18 +23,18 @@ same session. Cross-session relationships live in event data.
 
 ## Core event types
 
-| Event | Category | Context | Purpose |
-|---|---|---:|---|
-| `session.started` | control | no | Pins session descriptor and config |
-| `message.appended` | context | yes | Adds a canonical observation |
-| `context.compacted` | context | yes | Replaces covered messages in the working view |
-| `model.call.started` | trace | no | Records the exact requested configuration |
-| `model.call.completed` | trace | no | Records usage, termination, latency and errors |
-| `action.started` | trace | no | Records invocation, authority and idempotency |
-| `action.completed` | trace | no | Records the side-effect receipt |
-| `child.started` | trace | no | Relates parent, child and immutable fork event |
-| `child.completed` | context | yes | Returns conclusion and evidence to the parent |
-| `run.completed` | control | no | Records the loop outcome |
+| Event                  | Category | Context | Purpose                                        |
+| ---------------------- | -------- | ------: | ---------------------------------------------- |
+| `session.started`      | control  |      no | Pins session descriptor and config             |
+| `message.appended`     | context  |     yes | Adds a canonical observation                   |
+| `context.compacted`    | context  |     yes | Replaces covered messages in the working view  |
+| `model.call.started`   | trace    |      no | Records the exact requested configuration      |
+| `model.call.completed` | trace    |      no | Records usage, termination, latency and errors |
+| `action.started`       | trace    |      no | Records invocation, authority and idempotency  |
+| `action.completed`     | trace    |      no | Records the side-effect receipt                |
+| `child.started`        | trace    |      no | Relates parent, child and immutable fork event |
+| `child.completed`      | context  |     yes | Returns conclusion and evidence to the parent  |
+| `run.completed`        | control  |      no | Records the loop outcome                       |
 
 Applications may append namespaced types. Unknown types must survive storage
 round trips and be ignored by projections that do not understand them.
@@ -63,6 +63,13 @@ An action has two records:
 
 `unknown` is intentionally distinct from `failed`. It normally triggers a
 reconciliation step rather than a blind retry.
+
+At loop startup, the kernel inspects raw action events before calling the
+model. A started action without a terminal receipt checkpoints for
+reconciliation. A terminal receipt written before a crash but missing its
+model-visible tool-result message is repaired from the receipt. A tool call
+journaled before its corresponding `action.started` event also checkpoints
+instead of guessing whether execution began.
 
 ## Children
 

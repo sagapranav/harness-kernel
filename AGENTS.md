@@ -9,7 +9,8 @@ Read:
 1. `README.md`
 2. `ARCHITECTURE.md`
 3. `docs/EVENTS.md`
-4. the module you intend to change
+4. `docs/PROVIDERS.md` when changing provider behavior
+5. the module you intend to change
 
 Run `npm run check` before and after any behavioral change.
 

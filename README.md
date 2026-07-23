@@ -66,37 +66,37 @@ import {
   type ActionExecutor,
   type ImmutableRunConfig,
   type ModelInvoker,
-} from '@sagapranav/harness-kernel';
+} from "@sagapranav/harness-kernel";
 
 const journal = new MemoryJournalStore();
 const sessions = new SessionManager(journal, new MemorySessionCatalog());
 
 const config: ImmutableRunConfig = {
-  id: createId('config'),
+  id: createId("config"),
   version: 1,
   createdAt: nowIso(),
-  provider: { provider: 'openai', model: 'your-model' },
+  provider: { provider: "openai", model: "your-model" },
   tools: [
     {
-      name: 'search',
-      description: 'Search the application corpus.',
+      name: "search",
+      description: "Search the application corpus.",
       inputSchema: {
-        type: 'object',
-        properties: { query: { type: 'string' } },
-        required: ['query'],
+        type: "object",
+        properties: { query: { type: "string" } },
+        required: ["query"],
       },
     },
   ],
 };
 
-const session = await sessions.create(config, { purpose: 'Answer a question' });
+const session = await sessions.create(config, { purpose: "Answer a question" });
 await journal.append(
   session.id,
   messageEvent({
-    id: createId('msg'),
-    role: 'user',
+    id: createId("msg"),
+    role: "user",
     createdAt: nowIso(),
-    content: [{ type: 'text', text: 'What changed?' }],
+    content: [{ type: "text", text: "What changed?" }],
   }),
 );
 
@@ -112,8 +112,8 @@ const actions: ActionExecutor = {
   async execute(invocation) {
     return {
       invocationId: invocation.invocationId,
-      status: 'succeeded',
-      content: [{ type: 'text', text: 'Result from your tool adapter' }],
+      status: "succeeded",
+      content: [{ type: "text", text: "Result from your tool adapter" }],
     };
   },
 };
@@ -133,15 +133,17 @@ for child-session semantics.
 
 ## Package map
 
-| Import | Responsibility |
-|---|---|
+| Import                                | Responsibility                                             |
+| ------------------------------------- | ---------------------------------------------------------- |
 | `@sagapranav/harness-kernel/protocol` | Canonical messages, events, configs, receipts and evidence |
-| `…/journal` | In-memory and fsynced JSONL append-only stores |
-| `…/artifacts` | In-memory and filesystem content-addressed blobs |
-| `…/projection` | Context folds, compaction events and cold projections |
-| `…/providers` | OpenAI/Anthropic normalization and outbound encoding |
-| `…/loop` | The flat model → tools → model loop |
-| `…/sessions` | Immutable configs, sessions, forks and inherited context |
+| `…/journal`                           | In-memory and fsynced JSONL append-only stores             |
+| `…/artifacts`                         | In-memory and filesystem content-addressed blobs           |
+| `…/json`                              | Durable JSON validation and defensive cloning              |
+| `…/projection`                        | Context folds, compaction events and cold projections      |
+| `…/providers`                         | OpenAI/Anthropic normalization and outbound encoding       |
+| `…/loop`                              | The flat model → tools → model loop                        |
+| `…/sessions`                          | Immutable configs, sessions, forks and inherited context   |
+| `…/telemetry`                         | Rebuildable aggregate usage and action metrics             |
 
 The root import re-exports every public symbol.
 
@@ -171,7 +173,7 @@ await journal.append(
     summarizesThroughEventId: boundary.id,
     summary,
     evidenceRefs,
-    scope: 'including_inherited',
+    scope: "including_inherited",
     projectorVersion: 1,
   }),
 );
@@ -186,6 +188,11 @@ the parent context they received at their fork point.
 The protocol is a semantic intermediate representation, not a union of vendor
 JSON schemas. OpenAI- and Anthropic-specific behavior belongs in adapters.
 Unknown blocks may remain as `provider` blocks or be offloaded to an artifact.
+Normalization retains an exact provider snapshot by default. Pass a
+`rawArtifact` to keep that snapshot content-addressed instead of inline, or set
+`preserveRawResponse: false` when another layer already owns the raw payload.
+Outbound encoders throw `ProviderEncodingError` for content they cannot encode;
+they never silently discard a canonical block.
 
 Adding another provider should require a new adapter, not a journal migration.
 The `provider` field is therefore an extensible string.
@@ -196,11 +203,14 @@ The included memory and filesystem stores are reference implementations. For a
 distributed runtime, implement the small `JournalStore`, `ArtifactStore`,
 `ProjectionStore`, and `SessionCatalog` interfaces over your own database or
 object store. Preserve optimistic head checks and per-session append
-linearization.
+linearization. `JsonlJournalStore` serializes one in-process store instance; do
+not point multiple processes or multiple store instances at the same directory.
+Filesystem implementations hash application identifiers into bounded path
+components, so IDs do not need filesystem-safe syntax.
 
 Read [ARCHITECTURE.md](ARCHITECTURE.md) before extending the event model and
-[AGENTS.md](AGENTS.md) when asking an implementation agent to adopt the
-library.
+[docs/PROVIDERS.md](docs/PROVIDERS.md) before writing an adapter. Use
+[AGENTS.md](AGENTS.md) when asking an implementation agent to adopt the library.
 
 ## Development
 
