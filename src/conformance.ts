@@ -183,6 +183,37 @@ export async function checkJournalStore(
     requireCondition(events[0]?.id === firstId, "first event changed");
   });
 
+  await check(
+    checks,
+    "journal",
+    "concurrent conditional appends are exclusive",
+    async () => {
+      const expected = (await store.head(sessionId))?.id ?? null;
+      const results = await Promise.allSettled(
+        [0, 1].map((index) =>
+          store.append(
+            sessionId,
+            { category: "trace", type: "conformance.cas", data: { index } },
+            { expectedHeadId: expected },
+          ),
+        ),
+      );
+      const fulfilled = results.filter(
+        (result) => result.status === "fulfilled",
+      );
+      const conflicts = results.filter(
+        (result) =>
+          result.status === "rejected" &&
+          result.reason instanceof JournalConflictError,
+      );
+      requireCondition(
+        fulfilled.length === 1 && conflicts.length === 1,
+        "concurrent conditional appends did not resolve into one success and one JournalConflictError",
+      );
+      validateChain(sessionId, await store.read(sessionId));
+    },
+  );
+
   await check(checks, "journal", "reads are isolated copies", async () => {
     const firstRead = await store.read(sessionId);
     (firstRead[0]!.data as { nested: { value: number } }).nested.value = 99;
@@ -627,6 +658,9 @@ export async function checkFencedJournalStore(
   let firstLease:
     | Awaited<ReturnType<FencedJournalStore["acquireExecutionLease"]>>
     | undefined;
+  let currentLease:
+    | Awaited<ReturnType<FencedJournalStore["acquireExecutionLease"]>>
+    | undefined;
 
   await check(
     checks,
@@ -705,8 +739,74 @@ export async function checkFencedJournalStore(
       const events = await journal.read(sessionId);
       validateChain(sessionId, events);
       requireCondition(events.length === 2, "stale writer changed the journal");
+      currentLease = secondLease;
     },
   );
+
+  await check(
+    checks,
+    "execution",
+    "fenced append honors expected head",
+    async () => {
+      requireCondition(currentLease != null, "current lease is absent");
+      let conflict: unknown;
+      try {
+        await journal.appendFenced(
+          sessionId,
+          { category: "trace", type: "conformance.execution.cas", data: {} },
+          currentLease,
+          { expectedHeadId: null },
+        );
+      } catch (error) {
+        conflict = error;
+      }
+      requireCondition(
+        conflict instanceof JournalConflictError,
+        "stale expectedHeadId on a fenced append did not throw JournalConflictError",
+      );
+      requireCondition(
+        (await journal.read(sessionId)).length === 2,
+        "conflicting fenced append changed the journal",
+      );
+    },
+  );
+
+  await check(checks, "execution", "expired lease cannot append", async () => {
+    const expirySessionId = runtime.createId("execution_conformance");
+    const lease = await journal.acquireExecutionLease({
+      sessionId: expirySessionId,
+      ownerId: runtime.createId("worker"),
+      durationMs: 1,
+    });
+    requireCondition(lease !== null, "short lease could not be acquired");
+    // Expiry fencing can only be observed on an advancing adapter clock.
+    const deadline = Date.now() + 2_000;
+    while (Date.parse(runtime.nowIso()) <= Date.parse(lease.expiresAt)) {
+      requireCondition(
+        Date.now() < deadline,
+        "runtime clock did not advance past lease expiry; expiry fencing could not be verified",
+      );
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    let stale: unknown;
+    try {
+      await journal.appendFenced(
+        expirySessionId,
+        { category: "trace", type: "conformance.execution.expired", data: {} },
+        lease,
+      );
+    } catch (error) {
+      stale = error;
+    }
+    requireCondition(
+      stale instanceof ExecutionLeaseConflictError,
+      "expired lease append did not throw ExecutionLeaseConflictError",
+    );
+    requireCondition(
+      (await journal.read(expirySessionId)).length === 0,
+      "expired writer changed the journal",
+    );
+  });
 
   return checks;
 }

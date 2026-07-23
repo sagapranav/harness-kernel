@@ -1,3 +1,5 @@
+// Run with:
+//   npm install && npm run build && node dist/examples/manager-workers.js
 import {
   MemoryWorkQueue,
   SessionManager,
@@ -47,8 +49,9 @@ const browserWorker = new WorkerHost({
     "agent.run": {
       async handle(item, context) {
         await context.heartbeat();
-        // A real handler loads item.sessionId and its immutable config, obtains
-        // a fenced journal lease, then calls runAgentLoop().
+        // A real handler loads item.sessionId and its immutable config,
+        // obtains a fenced journal lease, then calls runAgentLoop() —
+        // examples/durable-worker.ts shows that composition end to end.
         return {
           status: "completed",
           result: { sessionId: item.sessionId },

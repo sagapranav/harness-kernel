@@ -89,8 +89,16 @@ interface WorkItem {
     maxContinuations: number;
   };
   payload?: unknown;
+  priority?: number;
+  notBefore?: string;
+  idempotencyKey?: string;
+  metadata?: Record<string, unknown>;
 }
 ```
+
+`createSessionRunWork()` builds this shape for an agent session with a
+deterministic `session:<id>:run` work ID; `DEFAULT_AGENT_WORK_POLICY` allows 3
+attempts per segment and 12 continuations.
 
 Keep queue payloads small. Put immutable config IDs, session IDs, artifact
 references, and routing metadata in them. Do not put credentials, complete
@@ -194,6 +202,12 @@ Workers advertise capabilities. A browser worker can run on a browser-equipped
 machine, a coding worker in a sandbox pool, and a research worker in another
 region. They consume the same work format.
 
+`runOne()` resolves to `idle`, `processed`, or `lease_lost`. `lease_lost`
+means the visibility lease expired or was superseded before the handler's
+resolution could be acknowledged: the queue will redeliver, the handler's
+journal writes are preserved, and the next delivery reconciles from durable
+history. Hosts should log it, not crash on it.
+
 The reference host deliberately runs at most one delivery. This keeps process
 lifecycle and backpressure out of the portable core:
 
@@ -238,6 +252,14 @@ check the fencing token in the same transaction as the append. A separate
 “is my lease valid?” request followed by an ordinary append has a race and is
 not a valid implementation.
 
+The loop adds a second, independent defense: every append it makes is an
+expected-head compare-and-append against the head it last observed. If another
+writer interleaves an event, the loop's next append throws
+`JournalConflictError` and the loop stops writing — including the run outcome.
+Handlers should treat that exception (and `ExecutionLeaseConflictError` from a
+lost session lease) as lost ownership and return a retryable failure; the
+journal stays linear and the next delivery recovers from durable history.
+
 Before every turn, renew both layers:
 
 ```ts
@@ -278,8 +300,16 @@ turn. A serverless worker can:
 
 Do not auto-continue every checkpoint reason. A host deadline or bounded turn
 slice is normally resumable. An unknown action postcondition requires
-reconciliation; blindly requeueing it can burn the continuation budget without
-resolving the effect.
+reconciliation: give `runAgentLoop()` a `reconcileAction` hook that checks the
+external postcondition and returns a terminal receipt, or record one out of
+band with `appendActionReconciliation()`. Blindly requeueing an unreconciled
+checkpoint burns the continuation budget without resolving the effect.
+
+The loop repairs the other crash boundaries on startup by itself: it executes
+tool calls that were journaled but never started, marks and re-invokes model
+calls whose response was lost, and replays a finished turn's lost outcome.
+Transient provider failures can be retried inside a delivery with the
+`modelRetryDelayMs` loop option instead of consuming a queue attempt.
 
 The application owns this mapping because it knows which failures are safe to
 retry:
@@ -414,7 +444,7 @@ Qualify real adapters in an isolated namespace:
 const report = await checkOrchestration({
   adapter: "postgres-and-sqs",
   queue,
-  journal: fencedJournal,
+  journal, // the FencedJournalStore itself, not a bindExecutionLease() view
   runtime,
 });
 
@@ -422,8 +452,10 @@ assertOrchestrationConformance(report);
 ```
 
 The checks cover immutable/idempotent enqueue, capability routing, exclusive
-leases, stale acknowledgements, retries, dead-lettering, continuations, and
-stale-writer journal fencing.
+leases, stale acknowledgements, retries, dead-lettering, continuations,
+stale-writer journal fencing, fenced conditional appends, and expired-lease
+rejection. The expiry check needs an advancing clock; a frozen deterministic
+runtime cannot verify it and fails with an explicit message.
 
 Also run `checkHarnessStorage()` for the semantic storage bundle. Passing an
 interface type is not evidence that a remote adapter implements its atomicity

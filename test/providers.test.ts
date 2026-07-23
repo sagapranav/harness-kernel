@@ -1,12 +1,16 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  createChatCompletionStreamAccumulator,
   fromAnthropicMessage,
   fromOpenAIChatCompletion,
   fromOpenAIResponse,
   nowIso,
   ProviderEncodingError,
+  sseJsonEvents,
   toAnthropicInput,
+  toOpenAIChatInput,
+  toOpenAIChatTools,
   toOpenAIInput,
 } from "../src/index.js";
 
@@ -190,6 +194,224 @@ test("OpenAI Responses encoding preserves item order and fails on unsupported ar
   );
 });
 
+test("multi-tool-call transcripts round-trip through both encoders", () => {
+  const messages = [
+    {
+      id: "user",
+      role: "user" as const,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      content: [{ type: "text" as const, text: "check both files" }],
+    },
+    {
+      id: "assistant",
+      role: "assistant" as const,
+      createdAt: "2026-01-01T00:00:01.000Z",
+      content: [
+        { type: "text" as const, text: "Reading both." },
+        {
+          type: "tool_call" as const,
+          id: "call-1",
+          name: "read",
+          input: { path: "a.ts" },
+        },
+        {
+          type: "tool_call" as const,
+          id: "call-2",
+          name: "read",
+          input: { path: "b.ts" },
+        },
+      ],
+    },
+    {
+      id: "tool-1",
+      role: "tool" as const,
+      createdAt: "2026-01-01T00:00:02.000Z",
+      content: [
+        {
+          type: "tool_result" as const,
+          toolCallId: "call-1",
+          name: "read",
+          isError: false,
+          content: [{ type: "text" as const, text: "contents of a" }],
+        },
+      ],
+    },
+    {
+      id: "tool-2",
+      role: "tool" as const,
+      createdAt: "2026-01-01T00:00:03.000Z",
+      content: [
+        {
+          type: "tool_result" as const,
+          toolCallId: "call-2",
+          name: "read",
+          isError: true,
+          content: [{ type: "text" as const, text: "b is missing" }],
+        },
+      ],
+    },
+  ];
+
+  const anthropic = toAnthropicInput(messages);
+  assert.deepEqual(
+    anthropic.messages.map((message) => message.role),
+    ["user", "assistant", "user"],
+  );
+  const merged = anthropic.messages[2]?.content as Array<{
+    type: string;
+    tool_use_id: string;
+    is_error: boolean;
+  }>;
+  assert.deepEqual(
+    merged.map((block) => [block.type, block.tool_use_id, block.is_error]),
+    [
+      ["tool_result", "call-1", false],
+      ["tool_result", "call-2", true],
+    ],
+  );
+
+  const openai = toOpenAIInput(messages);
+  assert.deepEqual(
+    openai.map((item) => item.type),
+    [
+      "message",
+      "message",
+      "function_call",
+      "function_call",
+      "function_call_output",
+      "function_call_output",
+    ],
+  );
+  assert.deepEqual(
+    openai
+      .filter((item) => item.type === "function_call_output")
+      .map((item) => item.call_id),
+    ["call-1", "call-2"],
+  );
+});
+
+test("Anthropic encodes native tool-result images and rejects bare artifacts", () => {
+  const artifact = {
+    sha256: "0".repeat(64),
+    uri: `sha256:${"0".repeat(64)}`,
+    bytes: 4,
+    mediaType: "image/png",
+  };
+  const nativeSource = {
+    type: "image",
+    source: { type: "base64", media_type: "image/png", data: "aGk=" },
+  };
+  const toolMessage = (image: object) => [
+    {
+      id: "tool",
+      role: "tool" as const,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      content: [
+        {
+          type: "tool_result" as const,
+          toolCallId: "call-1",
+          isError: false,
+          content: [{ type: "text" as const, text: "screenshot" }, image],
+        },
+      ],
+    },
+  ];
+
+  const encoded = toAnthropicInput(
+    toolMessage({
+      type: "image",
+      artifact,
+      providerMetadata: { raw: nativeSource },
+    }) as never,
+  );
+  const result = (
+    encoded.messages[0]?.content as Array<{ content: unknown }>
+  )[0];
+  assert.deepEqual(result?.content, [
+    { type: "text", text: "screenshot" },
+    nativeSource,
+  ]);
+
+  assert.throws(
+    () => toAnthropicInput(toolMessage({ type: "image", artifact }) as never),
+    ProviderEncodingError,
+  );
+});
+
+test("unencodable: describe downgrades blocks to deterministic placeholders", () => {
+  const artifact = {
+    sha256: "1".repeat(64),
+    uri: `sha256:${"1".repeat(64)}`,
+    bytes: 4,
+    mediaType: "image/png",
+  };
+  const messages = [
+    {
+      id: "assistant",
+      role: "assistant" as const,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      content: [
+        {
+          // Foreign-provider reasoning: replayable only to its origin.
+          type: "reasoning" as const,
+          text: "inspect",
+          providerMetadata: { raw: { type: "thinking", thinking: "inspect" } },
+        },
+        { type: "text" as const, text: "done" },
+      ],
+    },
+    {
+      id: "tool",
+      role: "tool" as const,
+      createdAt: "2026-01-01T00:00:01.000Z",
+      content: [
+        {
+          type: "tool_result" as const,
+          toolCallId: "call-1",
+          isError: false,
+          content: [
+            { type: "text" as const, text: "screenshot" },
+            { type: "image" as const, artifact },
+          ],
+        },
+      ],
+    },
+  ];
+
+  assert.throws(() => toOpenAIInput(messages), ProviderEncodingError);
+  const openai = toOpenAIInput(messages, { unencodable: "describe" });
+  const assistant = openai[0]?.content as Array<{ type: string; text: string }>;
+  assert.deepEqual(assistant[0], {
+    type: "output_text",
+    text: "[unencodable reasoning block]",
+  });
+  const output = openai.find((item) => item.type === "function_call_output");
+  assert.equal(
+    output?.output,
+    `screenshot\n[unencodable image block: ${artifact.uri}]`,
+  );
+
+  // Reasoning without native Anthropic metadata degrades the same way.
+  const bare = [
+    {
+      id: "assistant",
+      role: "assistant" as const,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      content: [{ type: "reasoning" as const, text: "hidden" }],
+    },
+  ];
+  assert.throws(() => toAnthropicInput(bare), ProviderEncodingError);
+  const anthropic = toAnthropicInput(bare, { unencodable: "describe" });
+  assert.deepEqual(anthropic.messages[0]?.content, [
+    { type: "text", text: "[unencodable reasoning block]" },
+  ]);
+
+  assert.throws(
+    () => toAnthropicInput(bare, { unencodable: "discard" as never }),
+    TypeError,
+  );
+});
+
 test("provider normalization exposes malformed tool arguments and ambiguous stops", () => {
   const malformed = fromOpenAIResponse(
     {
@@ -269,4 +491,211 @@ test("provider normalization rejects non-durable inputs and sanitizes token coun
       ]),
     ProviderEncodingError,
   );
+});
+
+test("Chat Completions outbound encoding links tools and results", () => {
+  const wire = toOpenAIChatInput([
+    {
+      id: "msg-sys",
+      role: "system",
+      createdAt: nowIso(),
+      content: [{ type: "text", text: "Be precise." }],
+    },
+    {
+      id: "msg-user",
+      role: "user",
+      createdAt: nowIso(),
+      content: [{ type: "text", text: "Add and check the clock." }],
+    },
+    {
+      id: "msg-call",
+      role: "assistant",
+      createdAt: nowIso(),
+      content: [
+        { type: "tool_call", id: "call-1", name: "add", input: { a: 1, b: 2 } },
+        { type: "tool_call", id: "call-2", name: "clock", input: {} },
+      ],
+    },
+    {
+      id: "msg-result-1",
+      role: "tool",
+      createdAt: nowIso(),
+      content: [
+        {
+          type: "tool_result",
+          toolCallId: "call-1",
+          isError: false,
+          content: [{ type: "text", text: "3" }],
+        },
+      ],
+    },
+    {
+      id: "msg-result-2",
+      role: "tool",
+      createdAt: nowIso(),
+      content: [
+        {
+          type: "tool_result",
+          toolCallId: "call-2",
+          isError: false,
+          content: [{ type: "text", text: "12:00" }],
+        },
+      ],
+    },
+  ]);
+
+  assert.deepEqual(
+    wire.map((message) => message.role),
+    ["system", "user", "assistant", "tool", "tool"],
+  );
+  const assistant = wire[2] as {
+    content: unknown;
+    tool_calls: Array<{ id: string; function: { arguments: string } }>;
+  };
+  assert.equal(assistant.content, null);
+  assert.deepEqual(
+    assistant.tool_calls.map((call) => call.id),
+    ["call-1", "call-2"],
+  );
+  assert.deepEqual(JSON.parse(assistant.tool_calls[0]!.function.arguments), {
+    a: 1,
+    b: 2,
+  });
+  assert.deepEqual(wire[3], {
+    role: "tool",
+    tool_call_id: "call-1",
+    content: "3",
+  });
+
+  const tools = toOpenAIChatTools([
+    {
+      name: "add",
+      description: "Add numbers.",
+      inputSchema: { type: "object" },
+    },
+  ]);
+  assert.deepEqual(tools, [
+    {
+      type: "function",
+      function: {
+        name: "add",
+        description: "Add numbers.",
+        parameters: { type: "object" },
+      },
+    },
+  ]);
+
+  assert.throws(
+    () =>
+      toOpenAIChatInput([
+        {
+          id: "msg-reasoning",
+          role: "assistant",
+          createdAt: nowIso(),
+          content: [{ type: "reasoning", text: "hidden" }],
+        },
+      ]),
+    ProviderEncodingError,
+  );
+});
+
+test("chat completion streams accumulate into a normalizable response", async () => {
+  // Modeled on a captured OpenRouter SSE stream: a comment heartbeat, a tool
+  // call split across chunks, empty-content finish chunks, and a usage chunk.
+  const sse = [
+    ": OPENROUTER PROCESSING",
+    "",
+    'data: {"id":"gen-1","model":"openai/gpt-4o-mini","choices":[{"index":0,"delta":{"role":"assistant","content":null,"tool_calls":[{"index":0,"id":"call-9","type":"function","function":{"name":"add","arguments":""}}]},"finish_reason":null}]}',
+    "",
+    'data: {"id":"gen-1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\\"a\\":1,"}}]},"finish_reason":null}]}',
+    "",
+    'data: {"id":"gen-1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\\"b\\":2}"}}]},"finish_reason":null}]}',
+    "",
+    'data: {"id":"gen-1","choices":[{"index":0,"delta":{"content":""},"finish_reason":"tool_calls"}]}',
+    "",
+    'data: {"id":"gen-1","choices":[{"index":0,"delta":{"content":""},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"cost":0.001}}',
+    "",
+    "data: [DONE]",
+    "",
+  ].join("\n");
+  const bytes = new TextEncoder().encode(sse);
+  async function* jaggedChunks(): AsyncGenerator<Uint8Array> {
+    for (let index = 0; index < bytes.length; index += 7) {
+      yield bytes.subarray(index, index + 7);
+    }
+  }
+
+  const accumulator = createChatCompletionStreamAccumulator();
+  const events: string[] = [];
+  for await (const chunk of sseJsonEvents(jaggedChunks())) {
+    for (const event of accumulator.push(chunk)) events.push(event.type);
+  }
+  assert.deepEqual(events, [
+    "tool_call_started",
+    "tool_call_arguments_delta",
+    "tool_call_arguments_delta",
+    "stream_completed",
+  ]);
+
+  const normalized = fromOpenAIChatCompletion(accumulator.response(), {
+    model: "openai/gpt-4o-mini",
+  });
+  // The empty streamed content must not become an empty text block.
+  assert.deepEqual(
+    normalized.message.content.map((block) => block.type),
+    ["tool_call"],
+  );
+  const call = normalized.message.content[0]!;
+  assert.deepEqual(call.type === "tool_call" ? call.input : null, {
+    a: 1,
+    b: 2,
+  });
+  assert.equal(normalized.telemetry.stopReason, "tool_use");
+  assert.equal(normalized.telemetry.usage.inputTokens, 10);
+  assert.equal(normalized.telemetry.costUsd, 0.001);
+});
+
+test("chat completion streams accumulate text and reasoning deltas", async () => {
+  const accumulator = createChatCompletionStreamAccumulator();
+  const collected: Array<{ type: string; text?: string }> = [];
+  for (const chunk of [
+    {
+      id: "gen-2",
+      model: "m",
+      choices: [{ index: 0, delta: { role: "assistant", reasoning: "thin" } }],
+    },
+    { id: "gen-2", choices: [{ index: 0, delta: { reasoning: "king" } }] },
+    { id: "gen-2", choices: [{ index: 0, delta: { content: "Hel" } }] },
+    { id: "gen-2", choices: [{ index: 0, delta: { content: "lo" } }] },
+    {
+      id: "gen-2",
+      choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+      usage: { prompt_tokens: 3, completion_tokens: 2 },
+    },
+  ]) {
+    collected.push(...accumulator.push(chunk));
+  }
+  assert.deepEqual(collected, [
+    { type: "reasoning_delta", text: "thin" },
+    { type: "reasoning_delta", text: "king" },
+    { type: "text_delta", text: "Hel" },
+    { type: "text_delta", text: "lo" },
+    { type: "stream_completed", finishReason: "stop" },
+  ]);
+
+  const normalized = fromOpenAIChatCompletion(accumulator.response(), {
+    model: "m",
+  });
+  assert.deepEqual(
+    normalized.message.content.map((block) => block.type),
+    ["text", "reasoning"],
+  );
+  const text = normalized.message.content[0]!;
+  assert.equal(text.type === "text" ? text.text : null, "Hello");
+  const reasoning = normalized.message.content[1]!;
+  assert.equal(
+    reasoning.type === "reasoning" ? reasoning.text : null,
+    "thinking",
+  );
+  assert.equal(normalized.telemetry.stopReason, "end");
 });

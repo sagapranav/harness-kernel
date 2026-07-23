@@ -1,3 +1,5 @@
+// Run with:
+//   npm install && npm run build && node dist/examples/basic-agent.js
 import {
   MemoryJournalStore,
   MemorySessionCatalog,
@@ -9,7 +11,7 @@ import {
   type ActionExecutor,
   type ImmutableRunConfig,
   type ModelInvoker,
-} from "../src/index.js";
+} from "@sagapranav/harness-kernel";
 
 const journal = new MemoryJournalStore();
 const sessions = new SessionManager(journal, new MemorySessionCatalog());

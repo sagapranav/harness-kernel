@@ -10,13 +10,17 @@ agents, scheduled agents, and deterministic multi-agent workflows:
 - pure context and cold projections over that journal;
 - content-addressed artifact offloading;
 - portable storage/runtime ports with reusable adapter conformance checks;
-- canonical messages and telemetry with OpenAI and Anthropic adapters;
+- canonical messages and telemetry with OpenAI, Anthropic, and
+  OpenAI-compatible (OpenRouter) adapters, including streaming accumulation;
 - a small provider-neutral agent loop;
 - first-class child journals with inherited-context projection;
 - a provider-neutral work queue, worker host, continuations, retries, and DLQ
   semantics;
 - fenced single-writer execution leases for distributed session journals;
-- action receipts, idempotency, evidence, and explicit absence semantics.
+- action receipts, idempotency, evidence, and explicit absence semantics;
+- crash-boundary recovery: interrupted actions reconcile against external
+  postconditions, lost model responses are marked and re-invoked, and lost
+  run outcomes are replayed from recorded telemetry.
 
 It does **not** prescribe a tool catalog, model SDK, database, UI, workflow
 engine, sandbox, or policy system.
@@ -44,10 +48,10 @@ search indexes, and child summaries are replaceable projections.
 npm install github:sagapranav/harness-kernel
 ```
 
-The package has no runtime dependencies. The portable core requires ES2022 and
-Web Crypto; `@sagapranav/harness-kernel/node` requires Node.js 20 or newer.
-The package name is reserved as `@sagapranav/harness-kernel` if it is later
-published to npm.
+The package has no runtime dependencies and is ESM-only. The portable core
+requires ES2022 and Web Crypto; `@sagapranav/harness-kernel/node` requires
+Node.js 20 or newer. The package name is reserved as
+`@sagapranav/harness-kernel` if it is later published to npm.
 
 ## A minimal agent
 
@@ -124,10 +128,28 @@ const outcome = await runAgentLoop({
 });
 ```
 
-See [`examples/basic-agent.ts`](examples/basic-agent.ts) for a runnable
-dependency-free example and [`examples/forked-review.ts`](examples/forked-review.ts)
-for child-session semantics. [`examples/manager-workers.ts`](examples/manager-workers.ts)
-shows a Claude-configured manager dispatching a capability-routed child worker.
+Runnable, dependency-free examples (build once, then run the compiled file):
+
+```bash
+npm install && npm run build
+node dist/examples/basic-agent.js
+```
+
+- [`examples/basic-agent.ts`](examples/basic-agent.ts) — the loop against a
+  deterministic model and tool;
+- [`examples/forked-review.ts`](examples/forked-review.ts) — child-session
+  forking, inherited context, and `noneFound` results;
+- [`examples/manager-workers.ts`](examples/manager-workers.ts) — a
+  Claude-configured manager dispatching a capability-routed child worker;
+- [`examples/durable-worker.ts`](examples/durable-worker.ts) — the full
+  durable composition: queue delivery, fenced session lease, lease renewal,
+  deadline checkpoint, and a continuation finishing the run;
+- [`examples/provider-normalization.ts`](examples/provider-normalization.ts)
+  — provider payloads normalized to canonical messages and re-encoded for
+  both providers;
+- [`examples/openrouter-streaming.ts`](examples/openrouter-streaming.ts) — a
+  live streaming agent over OpenRouter with tools (needs
+  `OPENROUTER_API_KEY`; skips politely without it).
 
 ## Package map
 
@@ -170,6 +192,11 @@ available from the explicit `/node` subpath.
 11. **Queue delivery is at least once.** Retries and continuations are distinct.
 12. **One distributed worker owns a session journal at a time.** A stale writer
     is rejected by an atomic fencing token, not merely a liveness check.
+13. **The loop never writes blind.** Every loop append is an expected-head
+    compare-and-append; a foreign write surfaces as a conflict, not an
+    interleaved transcript.
+14. **Crashes stall a run, never a session.** Every crash window has a
+    journaled repair path on the next start.
 
 ## Compaction
 
@@ -190,7 +217,10 @@ await journal.append(
 
 `projectContext()` uses the latest valid compaction event and retains later
 messages verbatim. Child sessions can use `including_inherited` to summarize
-the parent context they received at their fork point.
+the parent context they received at their fork point. Validate the boundary
+with `compactionBoundaryError()` first: a boundary that separates a tool call
+from its result would produce a transcript providers reject, and
+`projectContext()` ignores such compactions.
 
 ## Provider policy
 
@@ -201,10 +231,17 @@ Normalization retains an exact provider snapshot by default. Pass a
 `rawArtifact` to keep that snapshot content-addressed instead of inline, or set
 `preserveRawResponse: false` when another layer already owns the raw payload.
 Outbound encoders throw `ProviderEncodingError` for content they cannot encode;
-they never silently discard a canonical block.
+they never silently discard a canonical block. Pass
+`{ unencodable: "describe" }` to downgrade such blocks to explicit text
+placeholders instead — for example when re-encoding history across providers.
 
 Adding another provider should require a new adapter, not a journal migration.
-The `provider` field is therefore an extensible string.
+The `provider` field is therefore an extensible string. OpenRouter and other
+OpenAI-compatible endpoints work through `toOpenAIChatInput()` /
+`fromOpenAIChatCompletion()`; streaming responses fold through
+`sseJsonEvents()` and `createChatCompletionStreamAccumulator()` while the loop
+forwards live deltas via `onModelStream` and journals only the complete
+response.
 
 ## Storage and runtime adaptation
 
@@ -231,15 +268,18 @@ runtime, implement the small persistence and execution ports. Run
 namespaces. Runtime-created IDs, timestamps, and SHA-256 hashing are also
 injectable through `RuntimeServices`.
 
-`JsonlJournalStore` remains single-instance. Multiple writers require a
-transactional journal implementation with atomic expected-head comparison.
+`JsonlJournalStore` remains single-instance. It heals a torn tail line left by
+a crash and caches its tail so appends stay O(1), but multiple writers require
+a transactional journal implementation with atomic expected-head comparison.
 
 Read [ARCHITECTURE.md](ARCHITECTURE.md) before extending the event model and
 [docs/STORAGE.md](docs/STORAGE.md) before implementing a storage/runtime adapter.
 Read [docs/ORCHESTRATION.md](docs/ORCHESTRATION.md) before building a manager,
 CLI worker pool, queue adapter, or multi-machine deployment.
 Read [docs/PROVIDERS.md](docs/PROVIDERS.md) before writing a provider adapter.
-Use
+Read [docs/ADOPTION.md](docs/ADOPTION.md) for recipes that add the kernel to an
+existing harness, database, retrieval layer, or workflow engine.
+[docs/API.md](docs/API.md) indexes every exported symbol by module. Use
 [AGENTS.md](AGENTS.md) when asking an implementation agent to adopt the library.
 
 ## Development

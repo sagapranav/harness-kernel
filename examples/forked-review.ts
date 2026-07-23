@@ -1,3 +1,5 @@
+// Run with:
+//   npm install && npm run build && node dist/examples/forked-review.js
 import {
   MemoryJournalStore,
   MemorySessionCatalog,
@@ -6,7 +8,7 @@ import {
   messageEvent,
   nowIso,
   type ImmutableRunConfig,
-} from "../src/index.js";
+} from "@sagapranav/harness-kernel";
 
 const journal = new MemoryJournalStore();
 const manager = new SessionManager(journal, new MemorySessionCatalog());

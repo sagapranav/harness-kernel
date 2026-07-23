@@ -567,6 +567,16 @@ export type WorkerRunOutcome =
       workId: string;
       resolution: WorkResolution["status"] | "threw";
       record: WorkRecord;
+    }
+  | {
+      /**
+       * The visibility lease expired or was superseded before the resolution
+       * was acknowledged. The queue will redeliver; any journal writes the
+       * handler made are preserved and reconciled by the next delivery.
+       */
+      status: "lease_lost";
+      workId: string;
+      attemptedResolution: WorkResolution["status"] | "threw";
     };
 
 function errorText(error: unknown): string {
@@ -634,6 +644,31 @@ export class WorkerHost {
     }
 
     let record: WorkRecord;
+    try {
+      record = await this.resolve(lease, resolution);
+    } catch (error) {
+      if (error instanceof WorkLeaseConflictError) {
+        return {
+          status: "lease_lost",
+          workId: lease.item.id,
+          attemptedResolution: resolutionName,
+        };
+      }
+      throw error;
+    }
+    return {
+      status: "processed",
+      workId: lease.item.id,
+      resolution: resolutionName,
+      record,
+    };
+  }
+
+  private async resolve(
+    lease: WorkLease,
+    resolution: WorkResolution,
+  ): Promise<WorkRecord> {
+    let record: WorkRecord;
     switch (resolution.status) {
       case "completed":
         record = await this.options.queue.complete(lease, {
@@ -677,11 +712,6 @@ export class WorkerHost {
       default:
         throw new TypeError("worker handler returned an unknown resolution");
     }
-    return {
-      status: "processed",
-      workId: lease.item.id,
-      resolution: resolutionName,
-      record,
-    };
+    return record;
   }
 }

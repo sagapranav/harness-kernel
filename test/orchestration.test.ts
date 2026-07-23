@@ -97,12 +97,11 @@ test("work queue routes capabilities and enforces immutable enqueue", async () =
 });
 
 test("memory execution ports satisfy reusable orchestration conformance", async () => {
-  const clock = manualRuntime();
+  // Conformance verifies expiry fencing, which requires an advancing clock.
   const report = await checkOrchestration({
     adapter: "memory",
-    queue: new MemoryWorkQueue(clock.runtime),
-    journal: new MemoryFencedJournalStore(clock.runtime),
-    runtime: clock.runtime,
+    queue: new MemoryWorkQueue(),
+    journal: new MemoryFencedJournalStore(),
   });
   assertOrchestrationConformance(report);
   assert.equal(report.passed, true);
@@ -397,6 +396,33 @@ test("worker host performs one bounded delivery and can heartbeat", async () => 
     { ok: true },
   );
   assert.deepEqual(await host.runOne(), { status: "idle" });
+});
+
+test("worker host reports a lost lease instead of throwing", async () => {
+  const clock = manualRuntime();
+  const queue = new MemoryWorkQueue(clock.runtime);
+  await queue.enqueue(work("expiring"));
+  const host = new WorkerHost({
+    queue,
+    workerId: "worker",
+    capabilities: ["agent"],
+    visibilityTimeoutMs: 100,
+    handlers: {
+      "agent.run": {
+        async handle() {
+          clock.advance(1_000);
+          return { status: "completed", result: { ok: true } };
+        },
+      },
+    },
+  });
+  const outcome = await host.runOne();
+  assert.deepEqual(outcome, {
+    status: "lease_lost",
+    workId: "expiring",
+    attemptedResolution: "completed",
+  });
+  assert.equal((await queue.get("expiring"))?.state, "queued");
 });
 
 test("distributed worker composition renews both leases and runs through a fenced journal", async () => {

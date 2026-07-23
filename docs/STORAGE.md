@@ -6,16 +6,11 @@ storage, browser storage, a worker-local service, or a remote persistence API.
 
 ## Portable and host-specific imports
 
-The root package and these subpaths contain no Node built-ins:
-
-- `@sagapranav/harness-kernel`
-- `…/journal`
-- `…/artifacts`
-- `…/projection`
-- `…/sessions`
-- `…/storage`
-- `…/runtime`
-- `…/conformance`
+The root package and every subpath except `/node` contain no Node built-ins:
+`…/protocol`, `…/journal`, `…/execution`, `…/artifacts`, `…/conformance`,
+`…/json`, `…/projection`, `…/providers`, `…/runtime`, `…/loop`, `…/work`,
+`…/orchestration`, `…/sessions`, `…/storage`, and `…/telemetry` all run in
+browsers, edge runtimes, and workers with ES2022 and Web Crypto.
 
 Node filesystem implementations are isolated behind:
 
@@ -72,8 +67,13 @@ assertStorageConformance(report);
 ```
 
 The suite writes records. Use a disposable database, isolated namespace, or CI
-tenant. It checks append conflicts, concurrent linearization, defensive copies,
-content integrity, replaceable projections, and immutable catalog values.
+tenant. It checks append conflicts, concurrent conditional-append exclusivity,
+concurrent linearization, defensive copies, content integrity, replaceable
+projections, and immutable catalog values. Adapter-building helpers —
+`createJournalEvent`, `assertExpectedJournalHead`, `selectJournalEvents`,
+`validateChain`, `artifactReference`, `artifactBytes`, and the `canonicalJson`
+/ `jsonEqual` utilities — implement the fiddly parts of these contracts so a
+new adapter mostly supplies I/O.
 
 ## Journal implementations
 
@@ -86,8 +86,12 @@ sequence. A unique key on `(session_id, sequence)` is necessary but is not by
 itself sufficient to implement `expectedHeadId`.
 
 The included `JsonlJournalStore` is a single-instance reference adapter. It
-serializes calls made through that instance and syncs appended bytes, but it is
-not a distributed lock and must not have multiple writers for one root.
+serializes calls made through that instance, syncs appended bytes, and keeps a
+per-session tail cache so steady-state appends do not re-read the file. A
+partial final line left by a crash mid-write is ignored by reads and truncated
+before the next append; corruption anywhere before the final line still fails
+loudly. It is not a distributed lock and must not have multiple writers for
+one root.
 
 ## Artifact implementations
 

@@ -15,6 +15,7 @@ export const EVENT_TYPES = {
   contextCompacted: "context.compacted",
   modelCallStarted: "model.call.started",
   modelCallCompleted: "model.call.completed",
+  modelCallInterrupted: "model.call.interrupted",
   modelProtocolError: "model.protocol.error",
   actionStarted: "action.started",
   actionCompleted: "action.completed",
@@ -99,6 +100,56 @@ function eventEvidenceRefs(event: JournalEvent): ArtifactRef[] {
   ];
 }
 
+function unpairedToolCallError(
+  events: JournalEvent[],
+  boundaryIndex: number,
+): string | null {
+  const open = new Set<string>();
+  for (const event of events.slice(0, boundaryIndex + 1)) {
+    const message = eventMessage(event);
+    if (message === null || !Array.isArray(message.content)) continue;
+    for (const candidate of message.content) {
+      const block =
+        typeof candidate === "object" && candidate !== null
+          ? (candidate as unknown as Record<string, unknown>)
+          : null;
+      if (block?.type === "tool_call" && typeof block.id === "string") {
+        open.add(block.id);
+      }
+      if (
+        block?.type === "tool_result" &&
+        typeof block.toolCallId === "string"
+      ) {
+        open.delete(block.toolCallId);
+      }
+    }
+  }
+  if (open.size === 0) return null;
+  return `compaction boundary separates tool call(s) ${[...open].join(", ")} from their results`;
+}
+
+/**
+ * A compaction boundary must not separate a tool call from its recorded
+ * result; the projected transcript would carry unpaired blocks that provider
+ * encoders and APIs reject. Returns null when the boundary is safe. Check
+ * before appending a compaction event; projectContext() ignores compactions
+ * with unsafe boundaries.
+ */
+export function compactionBoundaryError(
+  sessionId: string,
+  events: JournalEvent[],
+  summarizesThroughEventId: string,
+): string | null {
+  validateChain(sessionId, events);
+  const boundaryIndex = events.findIndex(
+    (event) => event.id === summarizesThroughEventId,
+  );
+  if (boundaryIndex < 0) {
+    return `compaction boundary event ${summarizesThroughEventId} is not in the journal`;
+  }
+  return unpairedToolCallError(events, boundaryIndex);
+}
+
 export interface ProjectContextOptions {
   inheritedMessages?: CanonicalMessage[];
   inheritedEvidenceRefs?: ArtifactRef[];
@@ -129,7 +180,11 @@ export function projectContext(
     const boundaryIndex = events.findIndex(
       (candidate) => candidate.id === data.summarizesThroughEventId,
     );
-    if (boundaryIndex >= 0 && boundaryIndex < compactionIndex) {
+    if (
+      boundaryIndex >= 0 &&
+      boundaryIndex < compactionIndex &&
+      unpairedToolCallError(events, boundaryIndex) === null
+    ) {
       latest = { event, data, boundaryIndex };
       break;
     }
@@ -163,12 +218,43 @@ export function projectContext(
   const head = events.at(-1);
   return {
     sessionId,
-    messages,
+    messages: supersedeToolResults(messages),
     rawThroughEventId: head?.id ?? null,
     rawThroughSequence: head?.sequence ?? 0,
     compactionEventId,
     evidenceRefs: deduplicateArtifacts(evidenceRefs),
   };
+}
+
+/**
+ * A reconciled action appends a second tool-result message for the same call.
+ * Providers reject duplicate tool results, so the projected context keeps only
+ * the latest result per call; the raw journal retains every receipt.
+ */
+function supersedeToolResults(
+  messages: CanonicalMessage[],
+): CanonicalMessage[] {
+  const lastResultIndex = new Map<string, number>();
+  messages.forEach((message, index) => {
+    if (message.role !== "tool" || !Array.isArray(message.content)) return;
+    for (const block of message.content) {
+      if (block.type === "tool_result")
+        lastResultIndex.set(block.toolCallId, index);
+    }
+  });
+  return messages.flatMap((message, index) => {
+    if (message.role !== "tool" || !Array.isArray(message.content)) {
+      return [message];
+    }
+    const content = message.content.filter(
+      (block) =>
+        block.type !== "tool_result" ||
+        lastResultIndex.get(block.toolCallId) === index,
+    );
+    if (content.length === message.content.length) return [message];
+    if (content.length === 0) return [];
+    return [{ ...message, content }];
+  });
 }
 
 export function messageEvent(

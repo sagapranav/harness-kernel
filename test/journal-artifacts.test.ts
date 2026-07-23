@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { appendFile, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -160,6 +160,83 @@ test("jsonl journal linearizes concurrent appends", async () => {
       events.map((event) => event.sequence),
       Array.from({ length: 20 }, (_, index) => index + 1),
     );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("jsonl journal ignores and heals a torn tail line", async () => {
+  const root = await mkdtemp(join(tmpdir(), "harness-torn-"));
+  try {
+    const store = new JsonlJournalStore(root);
+    await store.append("torn", {
+      category: "trace",
+      type: "torn.one",
+      data: { index: 1 },
+    });
+    const second = await store.append("torn", {
+      category: "trace",
+      type: "torn.two",
+      data: { index: 2 },
+    });
+    const eventPath = join(
+      root,
+      createHash("sha256").update("torn", "utf8").digest("hex"),
+      "events.jsonl",
+    );
+    // A crash mid-append leaves a partial final line with no newline.
+    await appendFile(eventPath, '{"id":"torn-partial","sessionId":"torn"');
+
+    const restarted = new JsonlJournalStore(root);
+    assert.equal((await restarted.read("torn")).length, 2);
+    assert.equal((await restarted.head("torn"))?.type, "torn.two");
+
+    const third = await restarted.append("torn", {
+      category: "trace",
+      type: "torn.three",
+      data: { index: 3 },
+    });
+    assert.equal(third.sequence, 3);
+    assert.equal(third.parentId, second.id);
+    const contents = await readFile(eventPath, "utf8");
+    assert.ok(contents.endsWith("\n"));
+    assert.ok(!contents.includes("torn-partial"));
+    assert.equal(
+      contents.split("\n").filter((line) => line.length > 0).length,
+      3,
+    );
+    // The pre-crash instance converges despite its stale append cache.
+    assert.equal((await store.read("torn")).length, 3);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("jsonl journal still rejects interior corruption", async () => {
+  const root = await mkdtemp(join(tmpdir(), "harness-corrupt-"));
+  try {
+    const store = new JsonlJournalStore(root);
+    await store.append("corrupt", {
+      category: "trace",
+      type: "corrupt.one",
+      data: {},
+    });
+    await store.append("corrupt", {
+      category: "trace",
+      type: "corrupt.two",
+      data: {},
+    });
+    const eventPath = join(
+      root,
+      createHash("sha256").update("corrupt", "utf8").digest("hex"),
+      "events.jsonl",
+    );
+    const lines = (await readFile(eventPath, "utf8")).split("\n");
+    lines[0] = "garbage that is not a torn tail";
+    await writeFile(eventPath, lines.join("\n"));
+
+    const restarted = new JsonlJournalStore(root);
+    await assert.rejects(restarted.read("corrupt"), /invalid journal JSON/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

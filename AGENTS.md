@@ -9,10 +9,12 @@ Read:
 1. `README.md`
 2. `ARCHITECTURE.md`
 3. `docs/EVENTS.md`
-4. `docs/PROVIDERS.md` when changing provider behavior
-5. `docs/STORAGE.md` when changing runtime or persistence behavior
-6. `docs/ORCHESTRATION.md` when changing queues, workers, leases, or deployment
-7. the module you intend to change
+4. `docs/API.md` to locate exports without scanning source
+5. `docs/PROVIDERS.md` when changing provider behavior
+6. `docs/STORAGE.md` when changing runtime or persistence behavior
+7. `docs/ORCHESTRATION.md` when changing queues, workers, leases, or deployment
+8. `docs/ADOPTION.md` when integrating the kernel into an existing system
+9. the module you intend to change
 
 Run `npm run check` before and after any behavioral change.
 
@@ -34,6 +36,11 @@ Run `npm run check` before and after any behavioral change.
 - Never implement a distributed journal lease as a check-then-append race; the
   fencing token and append must be one atomic operation.
 - Never conflate a failed delivery retry with a successful host continuation.
+- Never remove the loop's expected-head compare-and-append or write to a
+  session the loop is running.
+- Never re-execute an action whose `action.started` event exists; reconcile it
+  from the external postcondition instead.
+- Never place a compaction boundary between a tool call and its result.
 
 ## How to reuse the library in another harness
 

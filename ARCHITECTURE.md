@@ -77,21 +77,34 @@ config/session puts remain immutable.
 
 `runAgentLoop()` intentionally knows very little:
 
-1. project context;
-2. append `model.call.started`;
-3. invoke the model;
-4. append telemetry and the canonical assistant message;
-5. execute tool calls concurrently;
-6. append completion-order receipts;
-7. append source-order tool-result messages;
-8. repeat or return a data-shaped outcome.
+1. repair crash boundaries left by an interrupted run;
+2. project context;
+3. append `model.call.started`;
+4. invoke the model;
+5. append telemetry and the canonical assistant message;
+6. execute tool calls concurrently;
+7. append completion-order receipts;
+8. append source-order tool-result messages;
+9. repeat or return a data-shaped outcome.
 
-Policy, retry strategy, approvals, sandboxing, provider streaming, retrieval,
-and UI broadcasting remain outside this function.
+Every append the loop makes is an expected-head compare-and-append serialized
+behind the head it last observed. A concurrent foreign writer therefore
+surfaces as a `JournalConflictError` instead of an interleaved transcript,
+independent of any lease machinery.
+
+Policy, approvals, sandboxing, retrieval, and UI broadcasting remain outside
+this function. Streaming passes through it without touching durability: the
+invoker forwards incremental `ModelStreamEvent`s to the host's
+`onModelStream` hook, and the journal records only the complete normalized
+response.
 
 `beforeTurn` lets a host renew queue and session leases. `shouldCheckpoint`
 lets a bounded runtime stop before its deadline and continue from durable
-history in another process.
+history in another process. `modelRetryDelayMs` lets a host retry thrown
+model invocations with its own backoff; every attempt is journaled.
+`reconcileAction` lets a host resolve an interrupted action from its external
+postcondition so a crashed session can resume instead of checkpointing
+forever.
 
 ## Execution plane
 
@@ -147,7 +160,16 @@ Consequential action adapters should:
 - use `pending` or `unknown` when completion cannot be established;
 - attach evidence produced outside the model.
 
-The loop checkpoints on `pending` or `unknown` instead of guessing.
+The loop checkpoints on `pending` or `unknown` instead of guessing. On the
+next run it asks the host's `reconcileAction` hook to establish the terminal
+receipt from the external postcondition; `appendActionReconciliation()`
+records the same repair out of band. The raw journal keeps every receipt, and
+the projected context keeps only the latest tool result per call.
+
+Crash windows around the model call are also repaired on startup: a lost
+response is marked with `model.call.interrupted` and re-invoked, and a
+finished turn whose outcome append was lost is replayed from recorded
+telemetry rather than re-invoked.
 
 ## Extending the protocol
 

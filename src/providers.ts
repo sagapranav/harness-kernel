@@ -7,9 +7,11 @@ import type {
   ContentBlock,
   Metadata,
   ModelStopReason,
+  ModelStreamEvent,
   NormalizedModelResponse,
   ProviderBlock,
   TokenUsage,
+  ToolDefinition,
 } from "./protocol.js";
 
 type UnknownRecord = Record<string, unknown>;
@@ -27,6 +29,20 @@ export interface NormalizeProviderOptions {
   /** Host identity/time services for generated canonical IDs and timestamps. */
   runtime?: RuntimeServices;
 }
+
+export interface ProviderEncodeOptions {
+  /**
+   * How to handle canonical content the target provider cannot express.
+   * The default rejects the encode so provider input is never weakened
+   * implicitly; `"describe"` replaces each such block with a deterministic
+   * text placeholder naming the block type and any artifact reference it
+   * carried — an explicit downgrade, never a silent omission. Structural
+   * errors (malformed messages, wrong roles) always throw.
+   */
+  unencodable?: "throw" | "describe";
+}
+
+type UnencodableMode = NonNullable<ProviderEncodeOptions["unencodable"]>;
 
 export class ProviderEncodingError extends Error {
   constructor(
@@ -374,7 +390,9 @@ export function fromOpenAIChatCompletion(
   const preserve = options.preserveUnknownBlocks ?? true;
   let refused = false;
 
-  if (typeof source.content === "string") {
+  // Empty-string content carries no semantics and would re-encode as an
+  // empty text block some providers reject.
+  if (typeof source.content === "string" && source.content.length > 0) {
     content.push({ type: "text", text: source.content });
   } else if (Array.isArray(source.content)) {
     for (const partValue of source.content) {
@@ -418,11 +436,15 @@ export function fromOpenAIChatCompletion(
       ),
     );
   }
-  if (typeof source.reasoning_content === "string") {
+  // OpenRouter and several compatible endpoints use `reasoning`; DeepSeek-style
+  // endpoints use `reasoning_content`.
+  const reasoning =
+    string(source.reasoning_content) ?? string(source.reasoning);
+  if (reasoning !== undefined && reasoning.length > 0) {
     content.push({
       type: "reasoning",
-      text: source.reasoning_content,
-      providerMetadata: { raw: source.reasoning_content },
+      text: reasoning,
+      providerMetadata: { raw: reasoning },
     });
   }
 
@@ -449,6 +471,12 @@ export function fromOpenAIChatCompletion(
         reasoningTokens: tokenCount(completionDetails.reasoning_tokens),
       },
       providerMetadata: compactProviderTelemetry(root),
+      // OpenRouter reports the request cost inside usage.
+      ...(typeof usage.cost === "number" &&
+      Number.isFinite(usage.cost) &&
+      usage.cost >= 0
+        ? { costUsd: usage.cost }
+        : {}),
       ...optionalString("servedModel", string(root.model)),
       ...optionalString("requestId", options.requestId ?? string(root.id)),
     },
@@ -569,26 +597,111 @@ function rawMetadata(block: {
     : null;
 }
 
-function textOnlyResult(provider: string, blocks: ContentBlock[]): string {
+function encodeMode(options: ProviderEncodeOptions): UnencodableMode {
   if (
-    !Array.isArray(blocks) ||
-    blocks.some(
-      (block) =>
-        typeof block !== "object" ||
-        block === null ||
-        block.type !== "text" ||
-        typeof block.text !== "string",
-    )
+    options.unencodable !== undefined &&
+    options.unencodable !== "throw" &&
+    options.unencodable !== "describe"
   ) {
-    throw new ProviderEncodingError(
-      provider,
-      "tool_result",
-      `${provider} tool-result encoding requires text-only content or an application resolver`,
-    );
+    throw new TypeError('unencodable must be "throw" or "describe"');
   }
+  return options.unencodable ?? "throw";
+}
+
+function blockArtifact(block: ContentBlock): ArtifactRef | undefined {
+  switch (block.type) {
+    case "image":
+    case "file":
+      return block.artifact;
+    case "provider":
+      return block.rawArtifact;
+    default:
+      return undefined;
+  }
+}
+
+function unencodableText(
+  provider: string,
+  block: ContentBlock,
+  mode: UnencodableMode,
+  detail: string,
+): string {
+  if (mode === "throw") {
+    throw new ProviderEncodingError(provider, block.type, detail);
+  }
+  const label =
+    block.type === "provider"
+      ? `provider block ${block.provider}/${block.providerType}`
+      : `${block.type} block`;
+  const ref = blockArtifact(block);
+  return ref === undefined
+    ? `[unencodable ${label}]`
+    : `[unencodable ${label}: ${ref.uri}]`;
+}
+
+/** Flattens tool-result content into the single string OpenAI output accepts. */
+function openAIResultOutput(
+  blocks: ContentBlock[],
+  mode: UnencodableMode,
+  provider = "openai",
+): string {
   return blocks
-    .map((block) => (block as { type: "text"; text: string }).text)
+    .map((block) =>
+      block.type === "text"
+        ? block.text
+        : unencodableText(
+            provider,
+            block,
+            mode,
+            `${provider} tool-result encoding requires text-only content or an application resolver`,
+          ),
+    )
     .join("\n");
+}
+
+function nativeAnthropicImage(block: {
+  providerMetadata?: Metadata;
+}): UnknownRecord | null {
+  const raw = rawMetadata(block);
+  return raw?.type === "image" &&
+    typeof raw.source === "object" &&
+    raw.source !== null
+    ? raw
+    : null;
+}
+
+function anthropicResultContent(
+  blocks: ContentBlock[],
+  mode: UnencodableMode,
+): string | UnknownRecord[] {
+  if (blocks.every((block) => block.type === "text")) {
+    return blocks.map((block) => block.text).join("\n");
+  }
+  return blocks.map((block) => {
+    if (block.type === "text") return { type: "text", text: block.text };
+    if (block.type === "image") {
+      const native = nativeAnthropicImage(block);
+      if (native !== null) return native;
+      return {
+        type: "text",
+        text: unencodableText(
+          "anthropic",
+          block,
+          mode,
+          "tool-result images must retain a native Anthropic source in provider metadata or use an application base64 resolver",
+        ),
+      };
+    }
+    return {
+      type: "text",
+      text: unencodableText(
+        "anthropic",
+        block,
+        mode,
+        `anthropic tool results cannot carry ${block.type} blocks`,
+      ),
+    };
+  });
 }
 
 function assertCanonicalForEncoding(
@@ -750,13 +863,19 @@ function assertCanonicalForEncoding(
 
 /**
  * Encodes canonical messages for OpenAI Responses API `input`. Unsupported
- * blocks fail loudly so provider input is never silently weakened.
+ * blocks fail loudly so provider input is never silently weakened, unless the
+ * caller opts into explicit `unencodable: "describe"` downgrades.
  */
-export function toOpenAIInput(messages: CanonicalMessage[]): UnknownRecord[] {
+export function toOpenAIInput(
+  messages: CanonicalMessage[],
+  options: ProviderEncodeOptions = {},
+): UnknownRecord[] {
+  const mode = encodeMode(options);
   assertCanonicalForEncoding("openai", messages);
   const items: UnknownRecord[] = [];
 
   for (const source of messages) {
+    const textType = source.role === "assistant" ? "output_text" : "input_text";
     let messageContent: UnknownRecord[] = [];
     const flushMessage = (): void => {
       if (messageContent.length === 0) return;
@@ -779,13 +898,11 @@ export function toOpenAIInput(messages: CanonicalMessage[]): UnknownRecord[] {
       switch (block.type) {
         case "text": {
           const raw = rawMetadata(block);
-          const expectedType =
-            source.role === "assistant" ? "output_text" : "input_text";
           messageContent.push(
             raw !== null &&
               (raw.type === "output_text" || raw.type === "input_text")
               ? { ...raw, text: block.text }
-              : { type: expectedType, text: block.text },
+              : { type: textType, text: block.text },
           );
           break;
         }
@@ -821,40 +938,46 @@ export function toOpenAIInput(messages: CanonicalMessage[]): UnknownRecord[] {
           items.push({
             type: "function_call_output",
             call_id: block.toolCallId,
-            output: textOnlyResult("openai", block.content),
+            output: openAIResultOutput(block.content, mode),
           });
           break;
         case "reasoning": {
-          flushMessage();
           const raw = rawMetadata(block);
           if (raw?.type !== "reasoning") {
-            throw new ProviderEncodingError(
-              "openai",
-              block.type,
-              "reasoning items must retain their original provider metadata",
-            );
+            messageContent.push({
+              type: textType,
+              text: unencodableText(
+                "openai",
+                block,
+                mode,
+                "reasoning items must retain their original provider metadata",
+              ),
+            });
+            break;
           }
+          flushMessage();
           items.push(raw);
           break;
         }
-        case "provider":
-          if (block.provider !== "openai") {
-            throw new ProviderEncodingError(
-              "openai",
-              block.type,
-              "foreign provider block",
-            );
-          }
+        case "provider": {
           if (
+            block.provider !== "openai" ||
             typeof block.raw !== "object" ||
             block.raw === null ||
             Array.isArray(block.raw)
           ) {
-            throw new ProviderEncodingError(
-              "openai",
-              block.type,
-              "provider block has no inline raw object",
-            );
+            messageContent.push({
+              type: textType,
+              text: unencodableText(
+                "openai",
+                block,
+                mode,
+                block.provider !== "openai"
+                  ? "foreign provider block"
+                  : "provider block has no inline raw object",
+              ),
+            });
+            break;
           }
           if (block.placement === "content")
             messageContent.push(block.raw as UnknownRecord);
@@ -863,13 +986,19 @@ export function toOpenAIInput(messages: CanonicalMessage[]): UnknownRecord[] {
             items.push(block.raw as UnknownRecord);
           }
           break;
+        }
         case "image":
         case "file":
-          throw new ProviderEncodingError(
-            "openai",
-            block.type,
-            `${block.type} artifacts require an application URL/base64 resolver`,
-          );
+          messageContent.push({
+            type: textType,
+            text: unencodableText(
+              "openai",
+              block,
+              mode,
+              `${block.type} artifacts require an application URL/base64 resolver`,
+            ),
+          });
+          break;
       }
     }
     flushMessage();
@@ -883,141 +1012,512 @@ export interface AnthropicInput {
 }
 
 /** Encodes canonical messages for Anthropic Messages API. */
-export function toAnthropicInput(messages: CanonicalMessage[]): AnthropicInput {
+export function toAnthropicInput(
+  messages: CanonicalMessage[],
+  options: ProviderEncodeOptions = {},
+): AnthropicInput {
+  const mode = encodeMode(options);
   assertCanonicalForEncoding("anthropic", messages);
   const systemParts: string[] = [];
   for (const source of messages.filter(
     (message) => message.role === "system",
   )) {
     for (const block of source.content) {
-      if (block.type !== "text") {
-        throw new ProviderEncodingError(
-          "anthropic",
-          block.type,
-          "system content must be text",
-        );
-      }
-      systemParts.push(block.text);
+      systemParts.push(
+        block.type === "text"
+          ? block.text
+          : unencodableText(
+              "anthropic",
+              block,
+              mode,
+              "system content must be text",
+            ),
+      );
     }
   }
 
-  const encoded = messages
-    .filter((source) => source.role !== "system")
-    .map((source) => {
-      const content: UnknownRecord[] = [];
-      for (const block of source.content) {
-        switch (block.type) {
-          case "text": {
-            const raw = rawMetadata(block);
-            content.push(
-              raw?.type === "text"
-                ? { ...raw, text: block.text }
-                : { type: "text", text: block.text },
-            );
-            break;
-          }
-          case "tool_call": {
-            if (source.role !== "assistant") {
-              throw new ProviderEncodingError(
-                "anthropic",
-                block.type,
-                "tool_use requires assistant role",
-              );
-            }
-            const raw = rawMetadata(block);
-            content.push(
-              raw?.type === "tool_use"
-                ? { ...raw, id: block.id, name: block.name, input: block.input }
-                : {
-                    type: "tool_use",
-                    id: block.id,
-                    name: block.name,
-                    input: block.input,
-                  },
-            );
-            break;
-          }
-          case "tool_result": {
-            if (source.role !== "tool" && source.role !== "user") {
-              throw new ProviderEncodingError(
-                "anthropic",
-                block.type,
-                "tool_result requires tool or user role",
-              );
-            }
-            const resultText = textOnlyResult("anthropic", block.content);
-            content.push({
-              type: "tool_result",
-              tool_use_id: block.toolCallId,
-              is_error: block.isError,
-              ...(resultText.length === 0 ? {} : { content: resultText }),
-            });
-            break;
-          }
-          case "reasoning": {
-            if (source.role !== "assistant") {
-              throw new ProviderEncodingError(
-                "anthropic",
-                block.type,
-                "thinking requires assistant role",
-              );
-            }
-            const raw = rawMetadata(block);
-            if (
-              raw === null ||
-              (raw.type !== "thinking" && raw.type !== "redacted_thinking")
-            ) {
-              throw new ProviderEncodingError(
-                "anthropic",
-                block.type,
-                "thinking blocks must retain their original provider metadata",
-              );
-            }
-            content.push(raw);
-            break;
-          }
-          case "provider":
-            if (block.provider !== "anthropic") {
-              throw new ProviderEncodingError(
-                "anthropic",
-                block.type,
-                "foreign provider block",
-              );
-            }
-            if (
-              typeof block.raw !== "object" ||
-              block.raw === null ||
-              Array.isArray(block.raw)
-            ) {
-              throw new ProviderEncodingError(
-                "anthropic",
-                block.type,
-                "provider block has no inline raw object",
-              );
-            }
-            content.push(block.raw as UnknownRecord);
-            break;
-          case "image":
-          case "file":
+  const encoded: Array<{ role: string; content: UnknownRecord[] }> = [];
+  let previousRole: CanonicalMessage["role"] | undefined;
+  for (const source of messages) {
+    if (source.role === "system") continue;
+    const content: UnknownRecord[] = [];
+    for (const block of source.content) {
+      switch (block.type) {
+        case "text": {
+          const raw = rawMetadata(block);
+          content.push(
+            raw?.type === "text"
+              ? { ...raw, text: block.text }
+              : { type: "text", text: block.text },
+          );
+          break;
+        }
+        case "tool_call": {
+          if (source.role !== "assistant") {
             throw new ProviderEncodingError(
               "anthropic",
               block.type,
-              `${block.type} artifacts require an application base64 resolver`,
+              "tool_use requires assistant role",
             );
+          }
+          const raw = rawMetadata(block);
+          content.push(
+            raw?.type === "tool_use"
+              ? { ...raw, id: block.id, name: block.name, input: block.input }
+              : {
+                  type: "tool_use",
+                  id: block.id,
+                  name: block.name,
+                  input: block.input,
+                },
+          );
+          break;
         }
+        case "tool_result": {
+          if (source.role !== "tool" && source.role !== "user") {
+            throw new ProviderEncodingError(
+              "anthropic",
+              block.type,
+              "tool_result requires tool or user role",
+            );
+          }
+          const result = anthropicResultContent(block.content, mode);
+          content.push({
+            type: "tool_result",
+            tool_use_id: block.toolCallId,
+            is_error: block.isError,
+            ...(typeof result === "string" && result.length === 0
+              ? {}
+              : { content: result }),
+          });
+          break;
+        }
+        case "reasoning": {
+          if (source.role !== "assistant") {
+            throw new ProviderEncodingError(
+              "anthropic",
+              block.type,
+              "thinking requires assistant role",
+            );
+          }
+          const raw = rawMetadata(block);
+          if (
+            raw === null ||
+            (raw.type !== "thinking" && raw.type !== "redacted_thinking")
+          ) {
+            content.push({
+              type: "text",
+              text: unencodableText(
+                "anthropic",
+                block,
+                mode,
+                "thinking blocks must retain their original provider metadata",
+              ),
+            });
+            break;
+          }
+          content.push(raw);
+          break;
+        }
+        case "provider":
+          if (
+            block.provider !== "anthropic" ||
+            typeof block.raw !== "object" ||
+            block.raw === null ||
+            Array.isArray(block.raw)
+          ) {
+            content.push({
+              type: "text",
+              text: unencodableText(
+                "anthropic",
+                block,
+                mode,
+                block.provider !== "anthropic"
+                  ? "foreign provider block"
+                  : "provider block has no inline raw object",
+              ),
+            });
+            break;
+          }
+          content.push(block.raw as UnknownRecord);
+          break;
+        case "image":
+        case "file":
+          content.push({
+            type: "text",
+            text: unencodableText(
+              "anthropic",
+              block,
+              mode,
+              `${block.type} artifacts require an application base64 resolver`,
+            ),
+          });
+          break;
       }
-      if (content.length === 0) {
-        throw new ProviderEncodingError(
-          "anthropic",
-          "message",
-          "Anthropic messages cannot be empty",
-        );
-      }
-      return { role: source.role === "tool" ? "user" : source.role, content };
-    });
+    }
+    if (content.length === 0) {
+      throw new ProviderEncodingError(
+        "anthropic",
+        "message",
+        "Anthropic messages cannot be empty",
+      );
+    }
+    // All tool_result blocks answering one assistant turn belong in a single
+    // Anthropic user message; splitting them suppresses parallel tool use.
+    const previous = encoded[encoded.length - 1];
+    if (source.role === "tool" && previousRole === "tool" && previous) {
+      previous.content.push(...content);
+    } else {
+      encoded.push({
+        role: source.role === "tool" ? "user" : source.role,
+        content,
+      });
+    }
+    previousRole = source.role;
+  }
 
   return {
     ...(systemParts.length === 0 ? {} : { system: systemParts.join("\n") }),
     messages: encoded,
+  };
+}
+
+/**
+ * Encodes canonical messages for the OpenAI Chat Completions `messages`
+ * shape, which OpenRouter and most OpenAI-compatible endpoints accept.
+ * Unsupported blocks fail loudly unless the caller opts into explicit
+ * `unencodable: "describe"` downgrades.
+ */
+export function toOpenAIChatInput(
+  messages: CanonicalMessage[],
+  options: ProviderEncodeOptions = {},
+): UnknownRecord[] {
+  const mode = encodeMode(options);
+  assertCanonicalForEncoding("openai-chat", messages);
+  const wire: UnknownRecord[] = [];
+
+  for (const source of messages) {
+    if (source.role === "tool") {
+      // Chat Completions requires one tool message per tool_call_id.
+      for (const block of source.content) {
+        if (block.type !== "tool_result") {
+          throw new ProviderEncodingError(
+            "openai-chat",
+            block.type,
+            "tool messages must contain tool_result blocks",
+          );
+        }
+        wire.push({
+          role: "tool",
+          tool_call_id: block.toolCallId,
+          content: openAIResultOutput(block.content, mode, "openai-chat"),
+        });
+      }
+      continue;
+    }
+
+    if (source.role === "assistant") {
+      const text: string[] = [];
+      const toolCalls: UnknownRecord[] = [];
+      for (const block of source.content) {
+        switch (block.type) {
+          case "text":
+            text.push(block.text);
+            break;
+          case "tool_call":
+            toolCalls.push({
+              id: block.id,
+              type: "function",
+              function: {
+                name: block.name,
+                arguments: JSON.stringify(block.input ?? {}),
+              },
+            });
+            break;
+          default:
+            text.push(
+              unencodableText(
+                "openai-chat",
+                block,
+                mode,
+                `chat completions assistant messages cannot carry ${block.type} blocks`,
+              ),
+            );
+        }
+      }
+      wire.push({
+        role: "assistant",
+        content: text.length === 0 ? null : text.join("\n"),
+        ...(toolCalls.length === 0 ? {} : { tool_calls: toolCalls }),
+      });
+      continue;
+    }
+
+    // system and user messages flatten to a single text string.
+    const text = source.content.map((block) =>
+      block.type === "text"
+        ? block.text
+        : unencodableText(
+            "openai-chat",
+            block,
+            mode,
+            `chat completions ${source.role} messages cannot carry ${block.type} blocks`,
+          ),
+    );
+    wire.push({ role: source.role, content: text.join("\n") });
+  }
+
+  return wire;
+}
+
+/** Encodes tool definitions for Chat Completions / OpenRouter requests. */
+export function toOpenAIChatTools(tools: ToolDefinition[]): UnknownRecord[] {
+  return tools.map((tool) => ({
+    type: "function",
+    function: {
+      name: tool.name,
+      description: tool.description,
+      parameters: tool.inputSchema,
+    },
+  }));
+}
+
+/**
+ * Parses a server-sent-event byte stream into its JSON `data:` payloads.
+ * Comment lines and heartbeats are skipped; the OpenAI-style `[DONE]`
+ * sentinel ends iteration. Works on a fetch response body or any byte
+ * iterable, in any Web Streams runtime.
+ */
+export async function* sseJsonEvents(
+  source: ReadableStream<Uint8Array> | AsyncIterable<Uint8Array>,
+): AsyncGenerator<unknown, void, undefined> {
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  const dataOf = (eventText: string): string =>
+    eventText
+      .split("\n")
+      .filter((line) => line.startsWith("data:"))
+      .map((line) => line.slice(5).trimStart())
+      .join("\n");
+
+  async function* bytes(): AsyncGenerator<Uint8Array, void, undefined> {
+    if (Symbol.asyncIterator in source) {
+      yield* source as AsyncIterable<Uint8Array>;
+      return;
+    }
+    const reader = (source as ReadableStream<Uint8Array>).getReader();
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) return;
+        if (value !== undefined) yield value;
+      }
+    } finally {
+      reader.releaseLock();
+    }
+  }
+
+  for await (const chunk of bytes()) {
+    buffer += decoder.decode(chunk, { stream: true });
+    buffer = buffer.replace(/\r\n/g, "\n");
+    let boundary: number;
+    while ((boundary = buffer.indexOf("\n\n")) !== -1) {
+      const data = dataOf(buffer.slice(0, boundary));
+      buffer = buffer.slice(boundary + 2);
+      if (data.length === 0) continue;
+      if (data === "[DONE]") return;
+      yield JSON.parse(data) as unknown;
+    }
+  }
+  const data = dataOf(buffer + decoder.decode());
+  if (data.length > 0 && data !== "[DONE]") yield JSON.parse(data) as unknown;
+}
+
+export interface ChatCompletionStreamAccumulator {
+  /** Feed one parsed chunk; returns the semantic deltas it contained. */
+  push(chunk: unknown): ModelStreamEvent[];
+  /**
+   * The accumulated response in the non-streaming Chat Completions shape,
+   * ready for fromOpenAIChatCompletion(); null before the first chunk.
+   */
+  response(): UnknownRecord | null;
+}
+
+interface StreamToolCallState {
+  id?: string;
+  type?: string;
+  name?: string;
+  arguments: string;
+  announced: boolean;
+}
+
+interface StreamChoiceState {
+  finishReason: string | null;
+  content: string | null;
+  reasoning: string | null;
+  toolCalls: Map<number, StreamToolCallState>;
+  completed: boolean;
+}
+
+/**
+ * Accumulates OpenAI-style Chat Completions stream chunks (as produced by
+ * OpenRouter and compatible endpoints) into the complete response shape while
+ * emitting canonical stream events for live projections. The journal should
+ * record only the accumulated response, never individual deltas.
+ */
+export function createChatCompletionStreamAccumulator(): ChatCompletionStreamAccumulator {
+  let envelope: UnknownRecord | null = null;
+  let usage: unknown;
+  const choices = new Map<number, StreamChoiceState>();
+
+  const choiceState = (index: number): StreamChoiceState => {
+    const existing = choices.get(index);
+    if (existing !== undefined) return existing;
+    const created: StreamChoiceState = {
+      finishReason: null,
+      content: null,
+      reasoning: null,
+      toolCalls: new Map(),
+      completed: false,
+    };
+    choices.set(index, created);
+    return created;
+  };
+
+  return {
+    push(chunkValue) {
+      const events: ModelStreamEvent[] = [];
+      const chunk = record(chunkValue);
+      envelope = envelope ?? {};
+      for (const key of [
+        "id",
+        "model",
+        "created",
+        "provider",
+        "system_fingerprint",
+        "service_tier",
+      ]) {
+        if (chunk[key] !== undefined && envelope[key] === undefined) {
+          envelope[key] = chunk[key];
+        }
+      }
+      if (chunk.usage !== undefined && chunk.usage !== null) {
+        usage = chunk.usage;
+      }
+
+      for (const choiceValue of list(chunk.choices)) {
+        const choice = record(choiceValue);
+        const index = Number.isSafeInteger(choice.index)
+          ? (choice.index as number)
+          : 0;
+        const state = choiceState(index);
+        const primary = index === 0;
+        const delta = record(choice.delta);
+
+        if (typeof delta.content === "string") {
+          state.content = (state.content ?? "") + delta.content;
+          if (primary && delta.content.length > 0) {
+            events.push({ type: "text_delta", text: delta.content });
+          }
+        }
+        const reasoningDelta =
+          string(delta.reasoning_content) ?? string(delta.reasoning);
+        if (reasoningDelta !== undefined) {
+          state.reasoning = (state.reasoning ?? "") + reasoningDelta;
+          if (primary && reasoningDelta.length > 0) {
+            events.push({ type: "reasoning_delta", text: reasoningDelta });
+          }
+        }
+        for (const callValue of list(delta.tool_calls)) {
+          const call = record(callValue);
+          const callIndex = Number.isSafeInteger(call.index)
+            ? (call.index as number)
+            : 0;
+          const accumulated = state.toolCalls.get(callIndex) ?? {
+            arguments: "",
+            announced: false,
+          };
+          const fn = record(call.function);
+          if (string(call.id) !== undefined) accumulated.id = call.id as string;
+          if (string(call.type) !== undefined)
+            accumulated.type = call.type as string;
+          if (string(fn.name) !== undefined)
+            accumulated.name = fn.name as string;
+          if (
+            !accumulated.announced &&
+            accumulated.id !== undefined &&
+            accumulated.name !== undefined
+          ) {
+            accumulated.announced = true;
+            if (primary) {
+              events.push({
+                type: "tool_call_started",
+                id: accumulated.id,
+                name: accumulated.name,
+              });
+            }
+          }
+          if (typeof fn.arguments === "string" && fn.arguments.length > 0) {
+            accumulated.arguments += fn.arguments;
+            if (primary && accumulated.id !== undefined) {
+              events.push({
+                type: "tool_call_arguments_delta",
+                id: accumulated.id,
+                delta: fn.arguments,
+              });
+            }
+          }
+          state.toolCalls.set(callIndex, accumulated);
+        }
+        const finish = string(choice.finish_reason);
+        if (finish !== undefined) {
+          state.finishReason = finish;
+          if (primary && !state.completed) {
+            state.completed = true;
+            events.push({ type: "stream_completed", finishReason: finish });
+          }
+        }
+      }
+      return events;
+    },
+
+    response() {
+      if (envelope === null) return null;
+      const encoded = [...choices.entries()]
+        .sort((left, right) => left[0] - right[0])
+        .map(([index, state]) => ({
+          index,
+          finish_reason: state.finishReason,
+          message: {
+            role: "assistant",
+            content: state.content === "" ? null : state.content,
+            ...(state.reasoning === null || state.reasoning.length === 0
+              ? {}
+              : { reasoning: state.reasoning }),
+            ...(state.toolCalls.size === 0
+              ? {}
+              : {
+                  tool_calls: [...state.toolCalls.entries()]
+                    .sort((left, right) => left[0] - right[0])
+                    .map(([callIndex, call]) => ({
+                      index: callIndex,
+                      ...(call.id === undefined ? {} : { id: call.id }),
+                      type: call.type ?? "function",
+                      function: {
+                        ...(call.name === undefined ? {} : { name: call.name }),
+                        arguments: call.arguments,
+                      },
+                    })),
+                }),
+          },
+        }));
+      return {
+        ...envelope,
+        object: "chat.completion",
+        choices: encoded,
+        ...(usage === undefined ? {} : { usage }),
+      };
+    },
   };
 }

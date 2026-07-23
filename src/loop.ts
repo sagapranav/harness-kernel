@@ -6,11 +6,13 @@ import { defaultRuntime, type RuntimeServices } from "./runtime.js";
 import type {
   ActionInvocation,
   ActionReceipt,
+  AppendEventInput,
   CanonicalMessage,
   ContextProjection,
   ImmutableRunConfig,
   JournalEvent,
   LoopOutcome,
+  ModelStreamEvent,
   NormalizedModelResponse,
   ToolCallBlock,
 } from "./protocol.js";
@@ -20,6 +22,12 @@ export interface ModelRequest {
   turnId: string;
   config: ImmutableRunConfig;
   context: ContextProjection;
+  /**
+   * Present when the host wants incremental output. A streaming-capable
+   * invoker forwards deltas here and still returns the complete normalized
+   * response; a non-streaming invoker may ignore it.
+   */
+  onStream?: (event: ModelStreamEvent) => void;
 }
 
 export interface ModelInvoker {
@@ -58,6 +66,36 @@ export interface AgentLoopOptions {
    * application-specific projections.
    */
   project?: () => Promise<ContextProjection>;
+  /**
+   * Host postcondition check for an action interrupted before its completion
+   * event, or resolved as pending/unknown. Return a terminal receipt to record
+   * the established result and let the run continue; return null to leave the
+   * session checkpointed for a later reconciliation attempt.
+   */
+  reconcileAction?: (item: {
+    invocation: ActionInvocation;
+    receipt?: ActionReceipt;
+  }) => Promise<ActionReceipt | null>;
+  /**
+   * Retry policy for thrown model invocations. Return a delay in milliseconds
+   * to retry the same turn, or null to record a failed outcome. Every attempt
+   * is journaled as its own model.call.started/completed pair.
+   */
+  modelRetryDelayMs?: (
+    error: unknown,
+    attempt: number,
+  ) => number | null | Promise<number | null>;
+  /**
+   * Receives incremental model output forwarded from the invoker. Streaming
+   * is a live projection for UIs; the journal still records only complete
+   * responses, so nothing durable depends on having observed the stream.
+   */
+  onModelStream?: (event: ModelStreamEvent, turnId: string) => void;
+}
+
+/** Reads through a function call so control flow narrowing cannot cache it. */
+function isAborted(signal?: AbortSignal): boolean {
+  return signal?.aborted === true;
 }
 
 function toolCalls(message: CanonicalMessage): ToolCallBlock[] {
@@ -203,7 +241,8 @@ function tokenCount(value: unknown): boolean {
 }
 
 export interface ActionStateInspection {
-  unstartedCalls: ToolCallBlock[];
+  /** Calls journaled in an assistant message before any execution trace. */
+  unstartedCalls: Array<{ call: ToolCallBlock; turnId: string | null }>;
   unresolved: Array<{ invocation: ActionInvocation; receipt?: ActionReceipt }>;
   missingResults: Array<{
     invocation: ActionInvocation;
@@ -218,7 +257,10 @@ export interface ActionStateInspection {
 export function inspectActionState(
   events: JournalEvent[],
 ): ActionStateInspection {
-  const calls = new Map<string, ToolCallBlock>();
+  const calls = new Map<
+    string,
+    { call: ToolCallBlock; turnId: string | null }
+  >();
   const starts = new Map<string, ActionInvocation>();
   const receipts = new Map<string, ActionReceipt>();
   const resultCallIds = new Set<string>();
@@ -239,7 +281,10 @@ export function inspectActionState(
             typeof block.id === "string" &&
             typeof block.name === "string"
           ) {
-            calls.set(block.id, block as unknown as ToolCallBlock);
+            calls.set(block.id, {
+              call: block as unknown as ToolCallBlock,
+              turnId: event.turnId,
+            });
           }
           if (
             block?.type === "tool_result" &&
@@ -271,7 +316,7 @@ export function inspectActionState(
     [...starts.values()].map((invocation) => invocation.call.id),
   );
   const unstartedCalls = [...calls.values()].filter(
-    (call) => !startedCallIds.has(call.id) && !resultCallIds.has(call.id),
+    ({ call }) => !startedCallIds.has(call.id) && !resultCallIds.has(call.id),
   );
   const unresolved: ActionStateInspection["unresolved"] = [];
   const missingResults: ActionStateInspection["missingResults"] = [];
@@ -413,11 +458,72 @@ function modelProtocolError(response: NormalizedModelResponse): string | null {
   return null;
 }
 
+function receiptProtocolError(
+  invocation: ActionInvocation,
+  receipt: ActionReceipt,
+): string | null {
+  if (receipt.invocationId !== invocation.invocationId) {
+    return `receipt correlation mismatch: expected ${invocation.invocationId}, got ${receipt.invocationId}`;
+  }
+  if (!["succeeded", "failed", "pending", "unknown"].includes(receipt.status)) {
+    return `invalid action status: ${String(receipt.status)}`;
+  }
+  if (!Array.isArray(receipt.content))
+    return "action receipt content must be an array";
+  try {
+    assertJsonSerializable(receipt);
+  } catch (error) {
+    return errorText(error);
+  }
+  const contentError = contentProtocolError(
+    receipt.content,
+    "action receipt content",
+  );
+  if (contentError !== null) return contentError;
+  if (receipt.evidenceRefs !== undefined) {
+    if (!Array.isArray(receipt.evidenceRefs))
+      return "action receipt evidenceRefs must be an array";
+    for (const ref of receipt.evidenceRefs) {
+      const issue = artifactError(ref);
+      if (issue !== null)
+        return `action receipt evidence ref is invalid: ${issue}`;
+    }
+  }
+  return null;
+}
+
+/**
+ * Serializes loop writes behind one tracked head so every append is an
+ * expected-head compare-and-append. A concurrent foreign writer surfaces as a
+ * JournalConflictError from the store instead of an interleaved transcript.
+ */
+class SessionAppender {
+  private queue: Promise<unknown> = Promise.resolve();
+
+  constructor(
+    private readonly journal: JournalStore,
+    private readonly sessionId: string,
+    private headId: string | null,
+  ) {}
+
+  append<TData>(input: AppendEventInput<TData>): Promise<JournalEvent<TData>> {
+    const run = this.queue.then(async () => {
+      const event = await this.journal.append(this.sessionId, input, {
+        expectedHeadId: this.headId,
+      });
+      this.headId = event.id;
+      return event;
+    });
+    this.queue = run.catch(() => undefined);
+    return run;
+  }
+}
+
 async function appendOutcome(
-  options: AgentLoopOptions,
+  appender: SessionAppender,
   outcome: LoopOutcome,
 ): Promise<LoopOutcome> {
-  await options.journal.append(options.sessionId, {
+  await appender.append({
     category: "control",
     type: EVENT_TYPES.runCompleted,
     data: { outcome },
@@ -427,17 +533,18 @@ async function appendOutcome(
 
 async function executeOne(
   options: AgentLoopOptions,
-  turnId: string,
+  appender: SessionAppender,
+  turnId: string | null,
   call: ToolCallBlock,
-): Promise<ActionReceipt> {
+): Promise<{ invocation: ActionInvocation; receipt: ActionReceipt }> {
   const invocation: ActionInvocation = {
     invocationId: (options.runtime ?? defaultRuntime).createId("invocation"),
     sessionId: options.sessionId,
-    turnId,
+    turnId: turnId ?? "",
     call,
     idempotencyKey: `${options.sessionId}:${call.id}`,
   };
-  await options.journal.append(options.sessionId, {
+  await appender.append({
     category: "trace",
     type: EVENT_TYPES.actionStarted,
     turnId,
@@ -447,33 +554,8 @@ async function executeOne(
   let receipt: ActionReceipt;
   try {
     receipt = await options.actions.execute(invocation, options.signal);
-    if (receipt.invocationId !== invocation.invocationId) {
-      throw new Error(
-        `receipt correlation mismatch: expected ${invocation.invocationId}, got ${receipt.invocationId}`,
-      );
-    }
-    if (
-      !["succeeded", "failed", "pending", "unknown"].includes(receipt.status)
-    ) {
-      throw new Error(`invalid action status: ${String(receipt.status)}`);
-    }
-    if (!Array.isArray(receipt.content))
-      throw new Error("action receipt content must be an array");
-    assertJsonSerializable(receipt);
-    const contentError = contentProtocolError(
-      receipt.content,
-      "action receipt content",
-    );
-    if (contentError !== null) throw new Error(contentError);
-    if (receipt.evidenceRefs !== undefined) {
-      if (!Array.isArray(receipt.evidenceRefs))
-        throw new Error("action receipt evidenceRefs must be an array");
-      for (const ref of receipt.evidenceRefs) {
-        const issue = artifactError(ref);
-        if (issue !== null)
-          throw new Error(`action receipt evidence ref is invalid: ${issue}`);
-      }
-    }
+    const receiptError = receiptProtocolError(invocation, receipt);
+    if (receiptError !== null) throw new Error(receiptError);
   } catch (error) {
     receipt = {
       invocationId: invocation.invocationId,
@@ -483,13 +565,13 @@ async function executeOne(
     };
   }
 
-  await options.journal.append(options.sessionId, {
+  await appender.append({
     category: "trace",
     type: EVENT_TYPES.actionCompleted,
     turnId,
     data: { invocation, receipt },
   });
-  return receipt;
+  return { invocation, receipt };
 }
 
 function resultMessage(
@@ -519,13 +601,297 @@ function resultMessage(
 }
 
 /**
+ * Records a host-established terminal receipt for an action that was
+ * interrupted before its completion event or resolved as pending/unknown.
+ * The next runAgentLoop() start appends the matching tool-result message and
+ * resumes the session. Prefer the `reconcileAction` loop option when the host
+ * can check the postcondition inline.
+ */
+export async function appendActionReconciliation(
+  journal: JournalStore,
+  invocation: ActionInvocation,
+  receipt: ActionReceipt,
+): Promise<JournalEvent> {
+  if (receipt.status !== "succeeded" && receipt.status !== "failed") {
+    throw new TypeError(
+      "reconciled receipts must have a terminal succeeded/failed status",
+    );
+  }
+  const receiptError = receiptProtocolError(invocation, receipt);
+  if (receiptError !== null) throw new TypeError(receiptError);
+  return journal.append(invocation.sessionId, {
+    category: "trace",
+    type: EVENT_TYPES.actionCompleted,
+    turnId: invocation.turnId,
+    data: { invocation, receipt },
+  });
+}
+
+function outcomeForFinalStop(stopReason: string, turns: number): LoopOutcome {
+  if (stopReason === "error") {
+    return {
+      status: "failed",
+      turns,
+      error: "provider returned an error termination",
+    };
+  }
+  if (stopReason === "aborted") return { status: "cancelled", turns };
+  if (stopReason === "length") {
+    return {
+      status: "checkpointed",
+      turns,
+      reason: "model output limit reached",
+    };
+  }
+  if (
+    stopReason === "pause" ||
+    stopReason === "tool_use" ||
+    stopReason === "unknown"
+  ) {
+    return {
+      status: "checkpointed",
+      turns,
+      reason: `provider stopped with ${stopReason} and no executable tool call`,
+    };
+  }
+  if (stopReason === "content_filter") {
+    return {
+      status: "failed",
+      turns,
+      error: "provider refused or filtered the response",
+    };
+  }
+  return { status: "completed", turns };
+}
+
+/** Events after the most recent run.completed, i.e. the interrupted run. */
+function openRunSegment(events: JournalEvent[]): JournalEvent[] {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    if (events[index]!.type === EVENT_TYPES.runCompleted) {
+      return events.slice(index + 1);
+    }
+  }
+  return events;
+}
+
+interface ModelCallState {
+  /** model.call.started with no later completion or interruption marker. */
+  danglingStartEventId: string | null;
+  danglingTurnId: string | null;
+  /** The last successful completion, if any, and what followed it. */
+  lastCompleted: {
+    eventId: string;
+    turnId: string | null;
+    error: string | null;
+    stopReason: string | null;
+  } | null;
+  assistantAfterLastCompleted: CanonicalMessage | null;
+  contextMessageAfterAssistant: boolean;
+}
+
+function inspectModelCallState(segment: JournalEvent[]): ModelCallState {
+  const state: ModelCallState = {
+    danglingStartEventId: null,
+    danglingTurnId: null,
+    lastCompleted: null,
+    assistantAfterLastCompleted: null,
+    contextMessageAfterAssistant: false,
+  };
+  for (const event of segment) {
+    const data = eventRecord(event);
+    if (event.type === EVENT_TYPES.modelCallStarted) {
+      state.danglingStartEventId = event.id;
+      state.danglingTurnId = event.turnId;
+    } else if (
+      event.type === EVENT_TYPES.modelCallCompleted ||
+      event.type === EVENT_TYPES.modelCallInterrupted
+    ) {
+      state.danglingStartEventId = null;
+      state.danglingTurnId = null;
+      if (event.type === EVENT_TYPES.modelCallCompleted) {
+        const telemetry = record(data.telemetry);
+        state.lastCompleted = {
+          eventId: event.id,
+          turnId: event.turnId,
+          error: typeof data.error === "string" ? data.error : null,
+          stopReason:
+            typeof telemetry?.stopReason === "string"
+              ? telemetry.stopReason
+              : null,
+        };
+        state.assistantAfterLastCompleted = null;
+        state.contextMessageAfterAssistant = false;
+      }
+    } else if (event.type === EVENT_TYPES.messageAppended) {
+      const message =
+        typeof data.message === "object" && data.message !== null
+          ? (data.message as CanonicalMessage)
+          : null;
+      if (message === null) continue;
+      if (
+        message.role === "assistant" &&
+        state.lastCompleted !== null &&
+        state.assistantAfterLastCompleted === null
+      ) {
+        state.assistantAfterLastCompleted = message;
+      } else if (state.assistantAfterLastCompleted !== null) {
+        state.contextMessageAfterAssistant = true;
+      }
+    }
+  }
+  return state;
+}
+
+/**
+ * Repairs crash-boundary state before the first new model call. Returns a
+ * terminal outcome when the interrupted run's conclusion can be established
+ * without invoking the model, or null to continue into the turn loop.
+ */
+async function recoverCrashBoundary(
+  options: AgentLoopOptions,
+  runtime: RuntimeServices,
+  appender: SessionAppender,
+  events: JournalEvent[],
+): Promise<LoopOutcome | null> {
+  const actionState = inspectActionState(events);
+  for (const missing of actionState.missingResults) {
+    await appender.append(
+      messageEvent(
+        resultMessage(missing.invocation, missing.receipt, runtime),
+        missing.invocation.turnId,
+      ),
+    );
+  }
+
+  const unreconciled: ActionStateInspection["unresolved"] = [];
+  for (const item of actionState.unresolved) {
+    const receipt =
+      options.reconcileAction === undefined
+        ? null
+        : await options.reconcileAction(item);
+    if (
+      receipt === null ||
+      (receipt.status !== "succeeded" && receipt.status !== "failed")
+    ) {
+      unreconciled.push(item);
+      continue;
+    }
+    const receiptError = receiptProtocolError(item.invocation, receipt);
+    if (receiptError !== null) {
+      throw new TypeError(`reconciled receipt is invalid: ${receiptError}`);
+    }
+    await appender.append({
+      category: "trace",
+      type: EVENT_TYPES.actionCompleted,
+      turnId: item.invocation.turnId,
+      data: { invocation: item.invocation, receipt },
+    });
+    await appender.append(
+      messageEvent(
+        resultMessage(item.invocation, receipt, runtime),
+        item.invocation.turnId,
+      ),
+    );
+  }
+  if (unreconciled.length > 0) {
+    return appendOutcome(appender, {
+      status: "checkpointed",
+      turns: 0,
+      reason: `${unreconciled.length} action(s) require receipt reconciliation`,
+    });
+  }
+
+  // Calls journaled before any execution trace never started their side
+  // effect, so executing them now is safe.
+  let recoveredPending = 0;
+  for (const unstarted of actionState.unstartedCalls) {
+    const { invocation, receipt } = await executeOne(
+      options,
+      appender,
+      unstarted.turnId,
+      unstarted.call,
+    );
+    await appender.append(
+      messageEvent(
+        resultMessage(invocation, receipt, runtime),
+        unstarted.turnId,
+      ),
+    );
+    if (receipt.status === "pending" || receipt.status === "unknown") {
+      recoveredPending += 1;
+    }
+  }
+  if (recoveredPending > 0) {
+    return appendOutcome(appender, {
+      status: "checkpointed",
+      turns: 0,
+      reason: "an action requires postcondition reconciliation",
+    });
+  }
+
+  const modelState = inspectModelCallState(openRunSegment(events));
+  if (modelState.danglingStartEventId !== null) {
+    // The response was never journaled; a fresh call is the only way forward.
+    await appender.append({
+      category: "trace",
+      type: EVENT_TYPES.modelCallInterrupted,
+      turnId: modelState.danglingTurnId,
+      data: {
+        phase: "invoke",
+        interruptedEventId: modelState.danglingStartEventId,
+        reason: "model call started but no completion was journaled",
+      },
+    });
+    return null;
+  }
+  if (
+    modelState.lastCompleted !== null &&
+    modelState.lastCompleted.error === null
+  ) {
+    if (modelState.assistantAfterLastCompleted === null) {
+      // Telemetry was recorded but the canonical message was lost.
+      await appender.append({
+        category: "trace",
+        type: EVENT_TYPES.modelCallInterrupted,
+        turnId: modelState.lastCompleted.turnId,
+        data: {
+          phase: "record",
+          interruptedEventId: modelState.lastCompleted.eventId,
+          reason:
+            "model call completed but its assistant message was not journaled",
+        },
+      });
+      return null;
+    }
+    if (
+      !modelState.contextMessageAfterAssistant &&
+      toolCalls(modelState.assistantAfterLastCompleted).length === 0 &&
+      modelState.lastCompleted.stopReason !== null
+    ) {
+      // The turn finished; only the outcome append was lost. Replay it from
+      // the recorded stop reason instead of re-invoking the model.
+      return appendOutcome(
+        appender,
+        outcomeForFinalStop(modelState.lastCompleted.stopReason, 0),
+      );
+    }
+  }
+  return null;
+}
+
+/**
  * Minimal provider-neutral loop.
  *
  * - The model and action surface are injected.
  * - Every observation is appended before it can affect the next call.
+ * - Every append is an expected-head compare-and-append; a concurrent foreign
+ *   writer surfaces as a JournalConflictError and stops the loop from writing.
  * - Action completion traces may be in completion order.
  * - Tool-result context messages are appended in source-call order.
  * - Provider and action failures become events and outcomes.
+ * - Crash boundaries are repaired on startup: never-started calls execute,
+ *   interrupted calls go through `reconcileAction`, lost model responses are
+ *   marked and re-invoked, and a finished turn's lost outcome is replayed.
  */
 export async function runAgentLoop(
   options: AgentLoopOptions,
@@ -537,40 +903,29 @@ export async function runAgentLoop(
   }
   let turns = 0;
   const priorEvents = await options.journal.read(options.sessionId);
-  const priorActionState = inspectActionState(priorEvents);
-  for (const missing of priorActionState.missingResults) {
-    await options.journal.append(
-      options.sessionId,
-      messageEvent(
-        resultMessage(missing.invocation, missing.receipt, runtime),
-        missing.invocation.turnId,
-      ),
-    );
-  }
-  if (
-    priorActionState.unresolved.length > 0 ||
-    priorActionState.unstartedCalls.length > 0
-  ) {
-    return appendOutcome(options, {
-      status: "checkpointed",
-      turns,
-      reason:
-        priorActionState.unresolved.length > 0
-          ? `${priorActionState.unresolved.length} action(s) require receipt reconciliation`
-          : `${priorActionState.unstartedCalls.length} tool call(s) were journaled before execution started`,
-    });
-  }
+  const appender = new SessionAppender(
+    options.journal,
+    options.sessionId,
+    priorEvents.at(-1)?.id ?? null,
+  );
+  const recovered = await recoverCrashBoundary(
+    options,
+    runtime,
+    appender,
+    priorEvents,
+  );
+  if (recovered !== null) return recovered;
 
   while (turns < limit) {
     if (options.signal?.aborted === true) {
-      return appendOutcome(options, { status: "cancelled", turns });
+      return appendOutcome(appender, { status: "cancelled", turns });
     }
     const checkpointReason = options.shouldCheckpoint?.() ?? null;
     if (checkpointReason !== null) {
       if (checkpointReason.length === 0) {
         throw new TypeError("checkpoint reason must not be empty");
       }
-      return appendOutcome(options, {
+      return appendOutcome(appender, {
         status: "checkpointed",
         turns,
         reason: checkpointReason,
@@ -588,56 +943,81 @@ export async function runAgentLoop(
           )
         : await options.project();
 
-    await options.journal.append(options.sessionId, {
-      category: "trace",
-      type: EVENT_TYPES.modelCallStarted,
-      turnId,
-      data: {
-        configId: options.config.id,
-        configVersion: options.config.version,
-        provider: options.config.provider,
-        contextThroughEventId: context.rawThroughEventId,
-      },
-    });
-
-    let response: NormalizedModelResponse;
-    try {
-      response = await options.model.invoke(
-        {
-          sessionId: options.sessionId,
-          turnId,
-          config: options.config,
-          context,
-        },
-        options.signal,
-      );
-    } catch (error) {
-      const message = errorText(error);
-      await options.journal.append(options.sessionId, {
+    let response: NormalizedModelResponse | null = null;
+    let attempt = 0;
+    while (response === null) {
+      await appender.append({
         category: "trace",
-        type: EVENT_TYPES.modelCallCompleted,
+        type: EVENT_TYPES.modelCallStarted,
         turnId,
         data: {
-          error: message,
-          telemetry: {
-            provider: options.config.provider.provider,
-            model: options.config.provider.model,
-            latencyMs: 0,
-            usage: { inputTokens: 0, outputTokens: 0 },
-            stopReason: "error",
-          },
+          configId: options.config.id,
+          configVersion: options.config.version,
+          provider: options.config.provider,
+          contextThroughEventId: context.rawThroughEventId,
         },
       });
-      return appendOutcome(options, {
-        status: "failed",
-        turns,
-        error: message,
-      });
+      try {
+        const onModelStream = options.onModelStream;
+        response = await options.model.invoke(
+          {
+            sessionId: options.sessionId,
+            turnId,
+            config: options.config,
+            context,
+            ...(onModelStream === undefined
+              ? {}
+              : {
+                  onStream: (event: ModelStreamEvent) =>
+                    onModelStream(event, turnId),
+                }),
+          },
+          options.signal,
+        );
+      } catch (error) {
+        attempt += 1;
+        const message = errorText(error);
+        await appender.append({
+          category: "trace",
+          type: EVENT_TYPES.modelCallCompleted,
+          turnId,
+          data: {
+            error: message,
+            telemetry: {
+              provider: options.config.provider.provider,
+              model: options.config.provider.model,
+              latencyMs: 0,
+              usage: { inputTokens: 0, outputTokens: 0 },
+              stopReason: "error",
+            },
+          },
+        });
+        const retryDelay =
+          isAborted(options.signal) || options.modelRetryDelayMs === undefined
+            ? null
+            : await options.modelRetryDelayMs(error, attempt);
+        if (retryDelay === null) {
+          return appendOutcome(appender, {
+            status: "failed",
+            turns,
+            error: message,
+          });
+        }
+        if (!Number.isSafeInteger(retryDelay) || retryDelay < 0) {
+          throw new TypeError(
+            "model retry delay must be a non-negative safe integer or null",
+          );
+        }
+        if (retryDelay > 0) await delay(retryDelay, options.signal);
+        if (isAborted(options.signal)) {
+          return appendOutcome(appender, { status: "cancelled", turns });
+        }
+      }
     }
 
     const protocolError = modelProtocolError(response);
     if (protocolError !== null) {
-      await options.journal.append(options.sessionId, {
+      await appender.append({
         category: "trace",
         type: EVENT_TYPES.modelCallCompleted,
         turnId,
@@ -652,19 +1032,19 @@ export async function runAgentLoop(
           },
         },
       });
-      await options.journal.append(options.sessionId, {
+      await appender.append({
         category: "trace",
         type: EVENT_TYPES.modelProtocolError,
         turnId,
         data: { error: protocolError },
       });
-      return appendOutcome(options, {
+      return appendOutcome(appender, {
         status: "failed",
         turns,
         error: protocolError,
       });
     }
-    await options.journal.append(options.sessionId, {
+    await appender.append({
       category: "trace",
       type: EVENT_TYPES.modelCallCompleted,
       turnId,
@@ -675,76 +1055,32 @@ export async function runAgentLoop(
           : { providerSnapshot: response.providerSnapshot }),
       },
     });
-    await options.journal.append(
-      options.sessionId,
-      messageEvent(response.message, turnId),
-    );
+    await appender.append(messageEvent(response.message, turnId));
 
     const calls = toolCalls(response.message);
     if (calls.length === 0) {
-      if (response.telemetry.stopReason === "error") {
-        return appendOutcome(options, {
-          status: "failed",
-          turns,
-          error: "provider returned an error termination",
-        });
-      }
-      if (response.telemetry.stopReason === "aborted") {
-        return appendOutcome(options, { status: "cancelled", turns });
-      }
-      if (response.telemetry.stopReason === "length") {
-        return appendOutcome(options, {
-          status: "checkpointed",
-          turns,
-          reason: "model output limit reached",
-        });
-      }
-      if (
-        response.telemetry.stopReason === "pause" ||
-        response.telemetry.stopReason === "tool_use" ||
-        response.telemetry.stopReason === "unknown"
-      ) {
-        return appendOutcome(options, {
-          status: "checkpointed",
-          turns,
-          reason: `provider stopped with ${response.telemetry.stopReason} and no executable tool call`,
-        });
-      }
-      if (response.telemetry.stopReason === "content_filter") {
-        return appendOutcome(options, {
-          status: "failed",
-          turns,
-          error: "provider refused or filtered the response",
-        });
-      }
-      return appendOutcome(options, { status: "completed", turns });
+      return appendOutcome(
+        appender,
+        outcomeForFinalStop(response.telemetry.stopReason, turns),
+      );
     }
 
-    const receipts = await Promise.all(
-      calls.map((call) => executeOne(options, turnId, call)),
+    const executions = await Promise.all(
+      calls.map((call) => executeOne(options, appender, turnId, call)),
     );
-    for (const [index, call] of calls.entries()) {
-      const receipt = receipts[index]!;
-      const invocation: ActionInvocation = {
-        invocationId: receipt.invocationId,
-        sessionId: options.sessionId,
-        turnId,
-        call,
-        idempotencyKey: `${options.sessionId}:${call.id}`,
-      };
-      await options.journal.append(
-        options.sessionId,
+    for (const { invocation, receipt } of executions) {
+      await appender.append(
         messageEvent(resultMessage(invocation, receipt, runtime), turnId),
       );
     }
 
     if (
-      receipts.some(
-        (receipt) =>
+      executions.some(
+        ({ receipt }) =>
           receipt.status === "pending" || receipt.status === "unknown",
       )
     ) {
-      return appendOutcome(options, {
+      return appendOutcome(appender, {
         status: "checkpointed",
         turns,
         reason: "an action requires postcondition reconciliation",
@@ -752,5 +1088,17 @@ export async function runAgentLoop(
     }
   }
 
-  return appendOutcome(options, { status: "limited", turns, limit });
+  return appendOutcome(appender, { status: "limited", turns, limit });
+}
+
+function delay(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    const settle = (): void => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", settle);
+      resolve();
+    };
+    const timer = setTimeout(settle, ms);
+    signal?.addEventListener("abort", settle, { once: true });
+  });
 }

@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
+  compactionBoundaryError,
   foldProjection,
   MemoryJournalStore,
   MemorySessionCatalog,
@@ -111,6 +112,139 @@ test("an invalid newer compaction cannot hide an earlier valid projection", asyn
       text,
     ),
     ["valid summary"],
+  );
+});
+
+test("compaction boundaries cannot split a tool call from its result", async () => {
+  const journal = new MemoryJournalStore();
+  const sessionId = "boundary";
+  await journal.append(sessionId, messageEvent(textMessage("user", "start")));
+  const callEvent = await journal.append(
+    sessionId,
+    messageEvent(
+      {
+        id: createId("msg"),
+        role: "assistant",
+        createdAt: nowIso(),
+        content: [
+          { type: "tool_call", id: "call-1", name: "search", input: {} },
+        ],
+      },
+      "turn-1",
+    ),
+  );
+  const resultEvent = await journal.append(
+    sessionId,
+    messageEvent(
+      {
+        id: createId("msg"),
+        role: "tool",
+        createdAt: nowIso(),
+        content: [
+          {
+            type: "tool_result",
+            toolCallId: "call-1",
+            isError: false,
+            content: [{ type: "text", text: "found" }],
+          },
+        ],
+      },
+      "turn-1",
+    ),
+  );
+
+  const events = await journal.read(sessionId);
+  assert.match(
+    compactionBoundaryError(sessionId, events, callEvent.id) ?? "",
+    /separates tool call/,
+  );
+  assert.equal(
+    compactionBoundaryError(sessionId, events, resultEvent.id),
+    null,
+  );
+  assert.match(
+    compactionBoundaryError(sessionId, events, "missing-event") ?? "",
+    /not in the journal/,
+  );
+
+  // A compaction with an unsafe boundary is ignored by the projection.
+  await journal.append(
+    sessionId,
+    compactionEvent({
+      summarizesThroughEventId: callEvent.id,
+      summary: textMessage("assistant", "summary hiding the call"),
+      evidenceRefs: [],
+      scope: "local",
+      projectorVersion: 1,
+    }),
+  );
+  const unsafe = projectContext(sessionId, await journal.read(sessionId));
+  assert.equal(unsafe.compactionEventId, null);
+
+  const safe = await journal.append(
+    sessionId,
+    compactionEvent({
+      summarizesThroughEventId: resultEvent.id,
+      summary: textMessage("assistant", "safe summary"),
+      evidenceRefs: [],
+      scope: "local",
+      projectorVersion: 1,
+    }),
+  );
+  const applied = projectContext(sessionId, await journal.read(sessionId));
+  assert.equal(applied.compactionEventId, safe.id);
+});
+
+test("a later tool result supersedes an earlier one in the projected context", async () => {
+  const journal = new MemoryJournalStore();
+  const sessionId = "supersede";
+  await journal.append(
+    sessionId,
+    messageEvent(
+      {
+        id: createId("msg"),
+        role: "assistant",
+        createdAt: nowIso(),
+        content: [{ type: "tool_call", id: "call-9", name: "send", input: {} }],
+      },
+      "turn-1",
+    ),
+  );
+  const result = (status: string, text: string): CanonicalMessage => ({
+    id: createId("msg"),
+    role: "tool",
+    createdAt: nowIso(),
+    content: [
+      {
+        type: "tool_result",
+        toolCallId: "call-9",
+        isError: false,
+        content: [{ type: "text", text }],
+      },
+    ],
+    metadata: { status },
+  });
+  await journal.append(
+    sessionId,
+    messageEvent(result("pending", "operation submitted"), "turn-1"),
+  );
+  await journal.append(
+    sessionId,
+    messageEvent(result("succeeded", "operation confirmed"), "turn-1"),
+  );
+
+  const projection = projectContext(sessionId, await journal.read(sessionId));
+  const toolMessages = projection.messages.filter(
+    (message) => message.role === "tool",
+  );
+  assert.equal(toolMessages.length, 1);
+  const resultBlock = toolMessages[0]!.content[0]!;
+  assert.equal(
+    resultBlock.type === "tool_result" &&
+      resultBlock.content[0]?.type === "text"
+      ? resultBlock.content[0].text
+      : null,
+    "operation confirmed",
   );
 });
 
