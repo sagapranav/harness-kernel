@@ -106,6 +106,34 @@ The digest is part of the protocol. An adapter must:
 Provider snapshots and large tool outputs can be offloaded before their
 references are appended to the journal.
 
+### Images, files, and other large payloads
+
+Binary and large payloads never live inside events. The flow is always the
+same:
+
+1. `artifacts.put(bytes, { mediaType })` stores the bytes and returns an
+   `ArtifactRef` — the SHA-256 digest, a `sha256:<digest>` URI, the byte
+   count, and the media type. Identical bytes always produce the same
+   reference, so puts are idempotent and duplicates are free.
+2. The event carries only that reference, inside an `image` or `file` content
+   block (`{ type: "image", artifact: ref }`). Journals stay small and
+   text-only.
+3. `artifacts.get(ref)` resolves the bytes back and re-checks the digest and
+   byte count, so silent corruption fails loudly.
+
+`createFileStorage` writes the bytes to
+`<root>/artifacts/<first-two-hex-of-digest>/<digest>` with an atomic,
+idempotent hard-link write; `createMemoryStorage` keeps them in memory. Either
+way the journal only ever holds the reference.
+
+Encoding an image or file back to a provider is a separate concern: a provider
+needs a URL, a file id, or base64, and the kernel cannot derive that from raw
+bytes. Inbound normalization preserves the provider's native form in the
+block's `providerMetadata.raw`, so a round-trip to the same provider works;
+otherwise the outbound encoders throw (or emit an explicit placeholder under
+`unencodable: "describe"`), and your adapter resolves the artifact bytes into
+the provider's required payload. See [PROVIDERS.md](PROVIDERS.md).
+
 ## Projection implementations
 
 Projection storage is a cache. Replacing a snapshot is allowed. Treat the tuple

@@ -187,26 +187,107 @@ available from the explicit `/node` subpath.
 
 ## Core invariants
 
-1. **Raw events are never rewritten.** A compaction is another event.
-2. **Every event belongs to exactly one session journal.**
-3. **Every session has one linear causal head.**
-4. **Configs are immutable and versioned.**
+1. **Raw events are never rewritten. A compaction is another event.** Once an
+   event is written it is never edited or deleted. Summarizing old history to
+   save context does not remove those events; it appends a new
+   `context.compacted` event that points at them, so the original record is
+   always still there to audit or replay.
+2. **Every event belongs to exactly one session journal.** An event is never
+   shared between two sessions. If two sessions relate (a parent and its
+   child), the link is stored as data inside an event, not by putting the same
+   event in both journals.
+3. **Every session has one linear causal head.** Each session is a single
+   ordered chain: every event records the id of the event before it, and there
+   is exactly one latest event ("the head"). There are no branches inside one
+   session, so the order of what happened is never ambiguous.
+4. **Configs are immutable and versioned.** The prompt, tool list, and model
+   settings for a run are stored as a fixed, numbered version. To change them
+   you write a new version instead of editing the old one, so you can always
+   see exactly which configuration produced any given run.
 5. **Provider-native data is normalized without being silently discarded.**
+   Responses from OpenAI, Anthropic, or OpenRouter are converted into one
+   common shape, but nothing is thrown away in the process: content this
+   version does not recognize is kept as a `provider` block, and the exact
+   original response is retained for audit.
 6. **Tool effects return receipts; timeouts may mean `unknown`, not `failed`.**
-7. **A child owns a new journal.** Its inherited parent context and its result in
-   the parent are projections.
-8. **Absence is representable.** Child results support `noneFound`.
-9. **Unknown event types survive reads.**
-10. **Cold projections are disposable.** They can always be rebuilt from raw
-    events and artifacts.
-11. **Queue delivery is at least once.** Retries and continuations are distinct.
-12. **One distributed worker owns a session journal at a time.** A stale writer
-    is rejected by an atomic fencing token, not merely a liveness check.
-13. **The loop never writes blind.** Every loop append is an expected-head
+   Every tool call records a receipt describing what happened. If a call times
+   out, the kernel does not assume it failed — the effect may have succeeded —
+   so it records the status as `unknown` and reconciles it later instead of
+   blindly retrying and doing the work twice.
+7. **A child owns a new journal. Its inherited parent context and its result in
+   the parent are projections.** A sub-agent gets its own separate journal. It
+   can read a snapshot of the parent's history up to the point it was forked,
+   but that snapshot is computed on demand — no parent events are copied — and
+   the child's answer shows up in the parent as a single summarizing event.
+8. **Absence is representable. Child results support `noneFound`.** A sub-agent
+   can explicitly report "I looked and found nothing." That is a real, distinct
+   result, not an empty response or an error, so the parent can tell the
+   difference between "no answer yet" and "the answer is that there is nothing."
+9. **Unknown event types survive reads.** An older version of the code can read
+   a journal that contains newer event types it does not understand. It ignores
+   those events but preserves them, so upgrading and downgrading never destroys
+   data written by another version.
+10. **Cold projections are disposable. They can always be rebuilt from raw
+    events and artifacts.** Derived views — the model's context, telemetry
+    totals, search indexes, UI state — are caches. You can delete any of them
+    and recompute it exactly from the raw events and stored artifacts, so a
+    corrupted or outdated view is never a real loss.
+11. **Queue delivery is at least once. Retries and continuations are distinct.**
+    A work item may be delivered more than once, so handlers must be safe to
+    run again. A "retry" means re-running a delivery that failed; a
+    "continuation" means picking up after a successful pause (like a serverless
+    deadline). They are counted separately so a long, healthy run is not
+    mistaken for a flaky, failing one.
+12. **One distributed worker owns a session journal at a time. A stale writer
+    is rejected by an atomic fencing token, not merely a liveness check.** When
+    work runs across machines, only one worker may write to a session at once.
+    Ownership is enforced by a number that increases each time ownership
+    changes and is checked in the same step as the write — so a slow or paused
+    old worker that "comes back to life" cannot corrupt the journal, even if it
+    still believes it is in charge.
+13. **The loop never writes blind. Every loop append is an expected-head
     compare-and-append; a foreign write surfaces as a conflict, not an
-    interleaved transcript.
-14. **Crashes stall a run, never a session.** Every crash window has a
-    journaled repair path on the next start.
+    interleaved transcript.** Before adding an event, the loop states which
+    event it expects to currently be the head. If anything else has written in
+    the meantime, the write is rejected with a conflict instead of quietly
+    mixing two writers' events together and producing a garbled transcript.
+14. **Crashes stall a run, never a session.** If the process dies at any point
+    — mid-tool-call, after a model reply but before it was saved, or after the
+    work finished but before that was recorded — the next start inspects the
+    journal and has a defined repair for that exact situation. A crash pauses
+    progress; it never leaves a session permanently broken or unusable.
+
+## Images, files, and other large payloads
+
+Large or binary data — screenshots, downloads, PDFs, model image output — is
+never stored inside events. The bytes go into the `ArtifactStore`, which keys
+them by their SHA-256 digest, and the event carries only a small `ArtifactRef`
+(the digest, a `sha256:` URI, the byte count, and a media type). This keeps
+journals small and text-only, makes identical bytes deduplicate automatically,
+and lets reads verify integrity by re-checking the digest.
+
+```ts
+// store the bytes, get back a reference
+const ref = await storage.artifacts.put(pngBytes, { mediaType: "image/png" });
+
+// the reference (not the bytes) travels inside a tool result / message
+const block = { type: "image", artifact: ref };
+
+// resolve the bytes back by reference, integrity-checked
+const bytes = await storage.artifacts.get(ref);
+```
+
+With `createFileStorage`, the bytes live on disk under
+`<root>/artifacts/<first-two-digest-chars>/<digest>`; with `createMemoryStorage`
+they live in memory. One boundary is deliberate: providers need an image as a
+URL, a file id, or base64, and the kernel cannot invent that mapping from raw
+bytes. So an image is encoded to a provider only when the canonical block still
+carries the provider's native form in `providerMetadata.raw` (as inbound
+normalization preserves it); otherwise `toAnthropicInput`/`toOpenAIInput` throw
+by default, or emit an explicit `[unencodable …]` placeholder under
+`{ unencodable: "describe" }`. Your adapter resolves artifact bytes into the
+provider's required payload. See [docs/STORAGE.md](docs/STORAGE.md) and
+[docs/PROVIDERS.md](docs/PROVIDERS.md).
 
 ## Compaction
 
