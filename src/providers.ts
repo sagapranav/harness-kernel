@@ -41,9 +41,31 @@ export interface ProviderEncodeOptions {
    * errors (malformed messages, wrong roles) always throw.
    */
   unencodable?: "throw" | "describe";
+  /**
+   * OpenAI image fidelity, set as the `detail` field on encoded images
+   * (Chat Completions and Responses only; Anthropic has no equivalent).
+   * `"low"` sends a fixed low-resolution image — far fewer input tokens,
+   * useful when exact detail is not needed. Omit to use the provider default
+   * (`auto`). Has no effect on models that do not accept images.
+   */
+  imageDetail?: "auto" | "low" | "high";
 }
 
 type UnencodableMode = NonNullable<ProviderEncodeOptions["unencodable"]>;
+
+function imageDetail(
+  options: ProviderEncodeOptions,
+): "auto" | "low" | "high" | undefined {
+  if (
+    options.imageDetail !== undefined &&
+    options.imageDetail !== "auto" &&
+    options.imageDetail !== "low" &&
+    options.imageDetail !== "high"
+  ) {
+    throw new TypeError('imageDetail must be "auto", "low", or "high"');
+  }
+  return options.imageDetail;
+}
 
 export class ProviderEncodingError extends Error {
   constructor(
@@ -960,6 +982,7 @@ export function toOpenAIInput(
   options: ProviderEncodeOptions = {},
 ): UnknownRecord[] {
   const mode = encodeMode(options);
+  const detail = imageDetail(options);
   assertCanonicalForEncoding("openai", messages);
   const items: UnknownRecord[] = [];
 
@@ -1085,6 +1108,7 @@ export function toOpenAIInput(
             messageContent.push({
               type: "input_image",
               image_url: dataUrl(block.artifact.mediaType, base64),
+              ...(detail === undefined ? {} : { detail }),
             });
             break;
           }
@@ -1320,6 +1344,7 @@ export function toOpenAIChatInput(
   options: ProviderEncodeOptions = {},
 ): UnknownRecord[] {
   const mode = encodeMode(options);
+  const detail = imageDetail(options);
   assertCanonicalForEncoding("openai-chat", messages);
   const wire: UnknownRecord[] = [];
 
@@ -1395,7 +1420,10 @@ export function toOpenAIChatInput(
           if (base64 !== null) {
             return {
               type: "image_url",
-              image_url: { url: dataUrl(block.artifact.mediaType, base64) },
+              image_url: {
+                url: dataUrl(block.artifact.mediaType, base64),
+                ...(detail === undefined ? {} : { detail }),
+              },
             };
           }
         }

@@ -788,3 +788,52 @@ test("inlineArtifactBytes passes tool-produced images back to the model", async 
     /relay tool-produced images as a user message/,
   );
 });
+
+test("imageDetail sets OpenAI image fidelity and omits by default", async () => {
+  const artifacts = new MemoryArtifactStore();
+  const ref = await artifacts.put(new Uint8Array([1, 2, 3]), {
+    mediaType: "image/png",
+  });
+  const messages = await inlineArtifactBytes(
+    [
+      {
+        id: "u",
+        role: "user" as const,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        content: [
+          { type: "text" as const, text: "look" },
+          { type: "image" as const, artifact: ref },
+        ],
+      },
+    ],
+    artifacts,
+  );
+
+  const defaultChat = toOpenAIChatInput(messages);
+  const defaultPart = (
+    defaultChat[0]!.content as Array<Record<string, unknown>>
+  ).find((part) => part.type === "image_url");
+  assert.equal(
+    (defaultPart!.image_url as Record<string, unknown>).detail,
+    undefined,
+  );
+
+  const lowChat = toOpenAIChatInput(messages, { imageDetail: "low" });
+  const lowPart = (lowChat[0]!.content as Array<Record<string, unknown>>).find(
+    (part) => part.type === "image_url",
+  );
+  assert.equal((lowPart!.image_url as Record<string, unknown>).detail, "low");
+
+  const responses = toOpenAIInput(messages, { imageDetail: "high" });
+  const imageItem = (
+    responses.find((item) => item.type === "message")!.content as Array<
+      Record<string, unknown>
+    >
+  ).find((part) => part.type === "input_image");
+  assert.equal(imageItem!.detail, "high");
+
+  assert.throws(
+    () => toOpenAIChatInput(messages, { imageDetail: "medium" as never }),
+    /imageDetail/,
+  );
+});

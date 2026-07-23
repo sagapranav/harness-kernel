@@ -4,3 +4,4 @@ export * from "./node/journal.js";
 export * from "./node/projection.js";
 export * from "./node/sessions.js";
 export * from "./node/storage.js";
+export * from "./node/viewer.js";

@@ -5,3 +5,6 @@ coverage/
 .DS_Store
 .env
 .npm-cache/
+
+# Local example output
+session-viewer.html
