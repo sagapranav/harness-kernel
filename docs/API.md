@@ -71,6 +71,7 @@ signatures live in the shipped source and `.d.ts` files.
 - `fromOpenAIResponse`, `fromOpenAIChatCompletion`, `fromAnthropicMessage` — normalize provider payloads (options: `preserveRawResponse`, `rawArtifact`, `preserveProviderMetadata`, `runtime`).
 - `toOpenAIInput`, `toAnthropicInput` — encode canonical messages to wire shapes; consecutive tool messages merge into one Anthropic user message.
 - `toOpenAIChatInput`, `toOpenAIChatTools` — encode messages and tool definitions for Chat Completions / OpenRouter requests.
+- `inlineArtifactBytes(messages, artifacts)` — resolve image/file `ArtifactRef`s to inline base64 (including images nested in tool results) so the encoders can emit a provider image payload; call it in a `ModelInvoker` before encoding.
 - `sseJsonEvents(byteStream)` — parse an SSE byte stream into JSON chunks (skips heartbeats, ends on `[DONE]`).
 - `createChatCompletionStreamAccumulator()` / `ChatCompletionStreamAccumulator` — fold OpenAI-style stream chunks into the complete response shape while emitting `ModelStreamEvent`s.
 - `ProviderEncodeOptions` — `unencodable: "throw" | "describe"` (explicit placeholder downgrade).

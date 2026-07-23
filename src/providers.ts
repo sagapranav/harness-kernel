@@ -1,10 +1,11 @@
-import { assertArtifactRef } from "./artifacts.js";
+import { assertArtifactRef, type ArtifactStore } from "./artifacts.js";
 import { assertJsonSerializable } from "./json.js";
 import { defaultRuntime, type RuntimeServices } from "./runtime.js";
 import type {
   ArtifactRef,
   CanonicalMessage,
   ContentBlock,
+  ImageBlock,
   Metadata,
   ModelStopReason,
   ModelStreamEvent,
@@ -639,6 +640,67 @@ function unencodableText(
     : `[unencodable ${label}: ${ref.uri}]`;
 }
 
+function base64FromBytes(bytes: Uint8Array): string {
+  let binary = "";
+  const chunk = 0x8000;
+  for (let offset = 0; offset < bytes.length; offset += chunk) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + chunk));
+  }
+  return btoa(binary);
+}
+
+function inlineBase64Of(block: { providerMetadata?: Metadata }): string | null {
+  const value = record(block.providerMetadata).inlineBase64;
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+function dataUrl(mediaType: string, base64: string): string {
+  return `data:${mediaType};base64,${base64}`;
+}
+
+/**
+ * Resolves image and file blocks that carry only an ArtifactRef into blocks
+ * that also carry inline base64 bytes, so the outbound encoders can emit a
+ * provider image payload. Fetches each block's bytes from the artifact store
+ * (including images nested inside tool_result content) and attaches them under
+ * `providerMetadata.inlineBase64`; blocks that already have inline or native
+ * provider data are left untouched. Call it in a ModelInvoker before
+ * toAnthropicInput()/toOpenAIInput()/toOpenAIChatInput() when a session may
+ * carry tool-produced images. Note: the OpenAI APIs cannot place an image
+ * inside a tool result, so an image returned by a tool must be relayed to
+ * those providers as a following user message; Anthropic accepts it in the
+ * tool result directly.
+ */
+export async function inlineArtifactBytes(
+  messages: CanonicalMessage[],
+  artifacts: ArtifactStore,
+): Promise<CanonicalMessage[]> {
+  const inlineBlock = async (block: ContentBlock): Promise<ContentBlock> => {
+    if (block.type === "tool_result") {
+      return {
+        ...block,
+        content: await Promise.all(block.content.map(inlineBlock)),
+      };
+    }
+    if (block.type !== "image" && block.type !== "file") return block;
+    if (inlineBase64Of(block) !== null) return block;
+    const bytes = await artifacts.get(block.artifact);
+    return {
+      ...block,
+      providerMetadata: {
+        ...(block.providerMetadata ?? {}),
+        inlineBase64: base64FromBytes(bytes),
+      },
+    };
+  };
+  return Promise.all(
+    messages.map(async (message) => ({
+      ...message,
+      content: await Promise.all(message.content.map(inlineBlock)),
+    })),
+  );
+}
+
 /** Flattens tool-result content into the single string OpenAI output accepts. */
 function openAIResultOutput(
   blocks: ContentBlock[],
@@ -653,7 +715,9 @@ function openAIResultOutput(
             provider,
             block,
             mode,
-            `${provider} tool-result encoding requires text-only content or an application resolver`,
+            block.type === "image"
+              ? `${provider} cannot place an image in a tool result; relay tool-produced images as a user message`
+              : `${provider} tool-result encoding requires text-only content or an application resolver`,
           ),
     )
     .join("\n");
@@ -670,6 +734,31 @@ function nativeAnthropicImage(block: {
     : null;
 }
 
+/**
+ * Anthropic-native image block from a canonical image: its original source if
+ * retained, otherwise inline base64 bytes (from inlineArtifactBytes()).
+ * Returns null when neither is available.
+ */
+function anthropicImageBlock(
+  block: ImageBlock,
+  _mode: UnencodableMode,
+): UnknownRecord | null {
+  const native = nativeAnthropicImage(block);
+  if (native !== null) return native;
+  const base64 = inlineBase64Of(block);
+  if (base64 !== null) {
+    return {
+      type: "image",
+      source: {
+        type: "base64",
+        media_type: block.artifact.mediaType,
+        data: base64,
+      },
+    };
+  }
+  return null;
+}
+
 function anthropicResultContent(
   blocks: ContentBlock[],
   mode: UnencodableMode,
@@ -680,15 +769,15 @@ function anthropicResultContent(
   return blocks.map((block) => {
     if (block.type === "text") return { type: "text", text: block.text };
     if (block.type === "image") {
-      const native = nativeAnthropicImage(block);
-      if (native !== null) return native;
+      const image = anthropicImageBlock(block, mode);
+      if (image !== null) return image;
       return {
         type: "text",
         text: unencodableText(
           "anthropic",
           block,
           mode,
-          "tool-result images must retain a native Anthropic source in provider metadata or use an application base64 resolver",
+          "tool-result images need inlineArtifactBytes(), a native Anthropic source in provider metadata, or an application base64 resolver",
         ),
       };
     }
@@ -987,7 +1076,31 @@ export function toOpenAIInput(
           }
           break;
         }
-        case "image":
+        case "image": {
+          const base64 = inlineBase64Of(block);
+          if (
+            base64 !== null &&
+            (source.role === "user" || source.role === "system")
+          ) {
+            messageContent.push({
+              type: "input_image",
+              image_url: dataUrl(block.artifact.mediaType, base64),
+            });
+            break;
+          }
+          messageContent.push({
+            type: textType,
+            text: unencodableText(
+              "openai",
+              block,
+              mode,
+              base64 !== null
+                ? `OpenAI accepts an image only in a user message, not a ${source.role} message; relay tool-produced images as a following user message`
+                : "image artifacts require inlineArtifactBytes() or an application URL/base64 resolver",
+            ),
+          });
+          break;
+        }
         case "file":
           messageContent.push({
             type: textType,
@@ -995,7 +1108,7 @@ export function toOpenAIInput(
               "openai",
               block,
               mode,
-              `${block.type} artifacts require an application URL/base64 resolver`,
+              "file artifacts require an application URL/base64 resolver",
             ),
           });
           break;
@@ -1141,7 +1254,21 @@ export function toAnthropicInput(
           }
           content.push(block.raw as UnknownRecord);
           break;
-        case "image":
+        case "image": {
+          const image = anthropicImageBlock(block, mode);
+          content.push(
+            image ?? {
+              type: "text",
+              text: unencodableText(
+                "anthropic",
+                block,
+                mode,
+                "image artifacts need inlineArtifactBytes() or an application base64 resolver",
+              ),
+            },
+          );
+          break;
+        }
         case "file":
           content.push({
             type: "text",
@@ -1149,7 +1276,7 @@ export function toAnthropicInput(
               "anthropic",
               block,
               mode,
-              `${block.type} artifacts require an application base64 resolver`,
+              "file artifacts require an application base64 resolver",
             ),
           });
           break;
@@ -1253,7 +1380,39 @@ export function toOpenAIChatInput(
       continue;
     }
 
-    // system and user messages flatten to a single text string.
+    // A user message with an inlined image becomes a content-part array
+    // (text + image_url); otherwise system/user messages flatten to a string.
+    const inlinableImage =
+      source.role === "user" &&
+      source.content.some(
+        (block) => block.type === "image" && inlineBase64Of(block) !== null,
+      );
+    if (inlinableImage) {
+      const parts = source.content.map((block) => {
+        if (block.type === "text") return { type: "text", text: block.text };
+        if (block.type === "image") {
+          const base64 = inlineBase64Of(block);
+          if (base64 !== null) {
+            return {
+              type: "image_url",
+              image_url: { url: dataUrl(block.artifact.mediaType, base64) },
+            };
+          }
+        }
+        return {
+          type: "text",
+          text: unencodableText(
+            "openai-chat",
+            block,
+            mode,
+            `chat completions user messages cannot carry ${block.type} blocks`,
+          ),
+        };
+      });
+      wire.push({ role: "user", content: parts });
+      continue;
+    }
+
     const text = source.content.map((block) =>
       block.type === "text"
         ? block.text
@@ -1261,7 +1420,9 @@ export function toOpenAIChatInput(
             "openai-chat",
             block,
             mode,
-            `chat completions ${source.role} messages cannot carry ${block.type} blocks`,
+            block.type === "image"
+              ? `chat completions cannot place an image in a ${source.role} message without inlineArtifactBytes(); relay tool-produced images as a user message`
+              : `chat completions ${source.role} messages cannot carry ${block.type} blocks`,
           ),
     );
     wire.push({ role: source.role, content: text.join("\n") });

@@ -5,6 +5,8 @@ import {
   fromAnthropicMessage,
   fromOpenAIChatCompletion,
   fromOpenAIResponse,
+  inlineArtifactBytes,
+  MemoryArtifactStore,
   nowIso,
   ProviderEncodingError,
   sseJsonEvents,
@@ -698,4 +700,91 @@ test("chat completion streams accumulate text and reasoning deltas", async () =>
     "thinking",
   );
   assert.equal(normalized.telemetry.stopReason, "end");
+});
+
+test("inlineArtifactBytes passes tool-produced images back to the model", async () => {
+  const png = Uint8Array.from(
+    atob(
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==",
+    ),
+    (c) => c.charCodeAt(0),
+  );
+  const artifacts = new MemoryArtifactStore();
+  const ref = await artifacts.put(png, { mediaType: "image/png" });
+
+  // A journaled tool result carrying only an artifact reference (as the loop
+  // produces it) cannot be encoded until the bytes are resolved.
+  const toolMessages = [
+    {
+      id: "t",
+      role: "tool" as const,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      content: [
+        {
+          type: "tool_result" as const,
+          toolCallId: "shot-1",
+          isError: false,
+          content: [{ type: "image" as const, artifact: ref }],
+        },
+      ],
+    },
+  ];
+  assert.throws(() => toAnthropicInput(toolMessages), ProviderEncodingError);
+
+  // Anthropic accepts the image inside the tool result once inlined.
+  const resolved = await inlineArtifactBytes(toolMessages, artifacts);
+  const anthropic = toAnthropicInput(resolved);
+  const toolResult = anthropic.messages
+    .flatMap((message) => message.content as Array<Record<string, unknown>>)
+    .find((block) => block.type === "tool_result");
+  const image = (toolResult!.content as Array<Record<string, unknown>>)[0]!;
+  assert.equal(image.type, "image");
+  assert.deepEqual(image.source, {
+    type: "base64",
+    media_type: "image/png",
+    data: btoa(String.fromCharCode(...png)),
+  });
+
+  // OpenAI cannot place an image in a tool result; it must be relayed as a
+  // user message, where inlining produces a data-url image part.
+  const relayed = await inlineArtifactBytes(
+    [
+      {
+        id: "u",
+        role: "user" as const,
+        createdAt: "2026-01-01T00:00:01.000Z",
+        content: [
+          { type: "text" as const, text: "Here is the screenshot:" },
+          { type: "image" as const, artifact: ref },
+        ],
+      },
+    ],
+    artifacts,
+  );
+  const chat = toOpenAIChatInput(relayed);
+  const parts = chat[0]!.content as Array<Record<string, unknown>>;
+  assert.deepEqual(
+    parts.map((part) => part.type),
+    ["text", "image_url"],
+  );
+  assert.match(
+    (parts[1]!.image_url as { url: string }).url,
+    /^data:image\/png;base64,/,
+  );
+  const responses = toOpenAIInput(relayed);
+  const item = responses.find(
+    (entry) =>
+      entry.type === "message" &&
+      Array.isArray(entry.content) &&
+      (entry.content as Array<Record<string, unknown>>).some(
+        (part) => part.type === "input_image",
+      ),
+  );
+  assert.ok(item);
+
+  // An image left in an OpenAI tool result still fails loudly with guidance.
+  assert.throws(
+    () => toOpenAIChatInput(resolved),
+    /relay tool-produced images as a user message/,
+  );
 });

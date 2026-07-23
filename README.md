@@ -279,14 +279,36 @@ const bytes = await storage.artifacts.get(ref);
 
 With `createFileStorage`, the bytes live on disk under
 `<root>/artifacts/<first-two-digest-chars>/<digest>`; with `createMemoryStorage`
-they live in memory. One boundary is deliberate: providers need an image as a
-URL, a file id, or base64, and the kernel cannot invent that mapping from raw
-bytes. So an image is encoded to a provider only when the canonical block still
-carries the provider's native form in `providerMetadata.raw` (as inbound
-normalization preserves it); otherwise `toAnthropicInput`/`toOpenAIInput` throw
-by default, or emit an explicit `[unencodable …]` placeholder under
-`{ unencodable: "describe" }`. Your adapter resolves artifact bytes into the
-provider's required payload. See [docs/STORAGE.md](docs/STORAGE.md) and
+they live in memory.
+
+**Passing a tool-produced image back to the model.** When a tool returns an
+image, that image needs to reach the model on the next turn. The reference
+travels through the journal and into the next turn's context automatically, but
+the encoders are synchronous and cannot read the artifact store, so before
+encoding you resolve the bytes with `inlineArtifactBytes(messages, artifacts)`.
+It fetches each image/file's bytes (including images nested in tool results) and
+attaches base64, which the encoders then emit as a real provider image payload:
+
+```ts
+const model: ModelInvoker = {
+  async invoke(request) {
+    const messages = await inlineArtifactBytes(
+      request.context.messages,
+      storage.artifacts,
+    );
+    return callProvider(toAnthropicInput(messages)); // or toOpenAIChatInput
+  },
+};
+```
+
+One provider difference is unavoidable and enforced by their APIs: **Anthropic**
+accepts an image directly inside the tool result, so this just works. **OpenAI**
+(Chat Completions and Responses) cannot put an image in a tool message, so the
+tool result stays text ("screenshot captured") and your handler relays the image
+as a following `user` message — where inlining turns it into a data-URL image
+part. If you skip resolution entirely, the encoders throw (or emit an explicit
+`[unencodable …]` placeholder under `{ unencodable: "describe" }`) rather than
+silently dropping the image. See [docs/STORAGE.md](docs/STORAGE.md) and
 [docs/PROVIDERS.md](docs/PROVIDERS.md).
 
 ## Compaction

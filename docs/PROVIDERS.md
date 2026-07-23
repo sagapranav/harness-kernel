@@ -57,6 +57,31 @@ block in a tool result encodes to its native base64 source block when the block
 retained that source in `providerMetadata.raw`; text-only results stay a plain
 string.
 
+### Passing images (and files) to the model
+
+Image and file blocks carry an `ArtifactRef`, not bytes. The encoders are
+synchronous and cannot read the artifact store, so resolve the bytes first with
+`inlineArtifactBytes(messages, artifacts)` — it fetches each block's bytes
+(including images nested inside tool results) and attaches base64 that the
+encoders emit as a provider image payload. Call it in the `ModelInvoker` before
+encoding.
+
+Where an image may appear differs by provider, and the encoders follow each
+API's real rules:
+
+- **Anthropic** accepts an image inside `tool_result` content and inside user
+  messages. A tool that returns an image is passed straight back to the model
+  after inlining — no restructuring needed.
+- **OpenAI Chat Completions and Responses** cannot place an image in a tool
+  message. The tool result must stay text, and the image is relayed as a
+  following `user` message, where inlining produces an `image_url` (Chat) or
+  `input_image` (Responses) content part. Attempting to encode an image inside
+  an OpenAI tool result throws with that guidance.
+
+Files follow the same reference model; there is no built-in provider mapping
+for file blocks yet, so they stay unencodable (or `describe` placeholders)
+until an application adapter encodes them.
+
 `toOpenAIChatInput()` emits the Chat Completions `messages` shape used by
 OpenRouter and most OpenAI-compatible endpoints: assistant tool calls become
 `tool_calls` entries with JSON-string arguments, and each canonical tool

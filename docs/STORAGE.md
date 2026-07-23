@@ -126,13 +126,16 @@ same:
 idempotent hard-link write; `createMemoryStorage` keeps them in memory. Either
 way the journal only ever holds the reference.
 
-Encoding an image or file back to a provider is a separate concern: a provider
-needs a URL, a file id, or base64, and the kernel cannot derive that from raw
-bytes. Inbound normalization preserves the provider's native form in the
-block's `providerMetadata.raw`, so a round-trip to the same provider works;
-otherwise the outbound encoders throw (or emit an explicit placeholder under
-`unencodable: "describe"`), and your adapter resolves the artifact bytes into
-the provider's required payload. See [PROVIDERS.md](PROVIDERS.md).
+Encoding an image or file back to a provider is a separate step: a provider
+needs a URL, a file id, or base64, and the synchronous encoders cannot read the
+artifact store. Resolve the bytes first with
+`inlineArtifactBytes(messages, artifacts)` — it fetches each image/file's bytes
+(including images nested in tool results) and attaches base64 the encoders emit
+as a provider image payload. Anthropic accepts the image inside the tool result
+directly; OpenAI cannot, so a tool-produced image is relayed as a following
+user message. Without resolution the encoders throw (or emit an explicit
+placeholder under `unencodable: "describe"`) rather than dropping the image. See
+[PROVIDERS.md](PROVIDERS.md).
 
 ## Projection implementations
 
