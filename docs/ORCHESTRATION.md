@@ -117,10 +117,11 @@ counter and continuation counter mean different things:
 Conflating them makes long valid runs look like flaky retries and makes retry
 limits accidentally cap total task duration.
 
-## A manager model, including Claude
+## Manager sessions on any provider
 
 A manager is an ordinary session whose action surface includes a spawn action.
-Selecting Claude is configuration, not an orchestration primitive:
+Which model runs it — Claude, an OpenAI model, or anything behind an adapter —
+is configuration, not an orchestration primitive:
 
 ```ts
 const managerConfig = {

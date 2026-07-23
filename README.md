@@ -139,8 +139,10 @@ node dist/examples/basic-agent.js
   deterministic model and tool;
 - [`examples/forked-review.ts`](examples/forked-review.ts) — child-session
   forking, inherited context, and `noneFound` results;
-- [`examples/manager-workers.ts`](examples/manager-workers.ts) — a
-  Claude-configured manager dispatching a capability-routed child worker;
+- [`examples/manager-workers.ts`](examples/manager-workers.ts) — cross-provider
+  orchestration: a manager session on one provider (Anthropic in the example)
+  dispatching a capability-routed child worker on another (OpenAI); which model
+  runs a session is configuration, not an orchestration primitive;
 - [`examples/durable-worker.ts`](examples/durable-worker.ts) — the full
   durable composition: queue delivery, fenced session lease, lease renewal,
   deadline checkpoint, and a continuation finishing the run;
