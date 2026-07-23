@@ -20,7 +20,9 @@ agents, scheduled agents, and deterministic multi-agent workflows:
 - action receipts, idempotency, evidence, and explicit absence semantics;
 - crash-boundary recovery: interrupted actions reconcile against external
   postconditions, lost model responses are marked and re-invoked, and lost
-  run outcomes are replayed from recorded telemetry.
+  run outcomes are replayed from recorded telemetry;
+- a self-contained local transcript viewer that renders a session and its
+  sub-agents from the raw logs.
 
 It does **not** prescribe a tool catalog, model SDK, database, UI, workflow
 engine, sandbox, or policy system.
@@ -159,7 +161,9 @@ node dist/examples/basic-agent.js
   both providers;
 - [`examples/openrouter-streaming.ts`](examples/openrouter-streaming.ts) — a
   live streaming agent over OpenRouter with tools (needs
-  `OPENROUTER_API_KEY`; skips politely without it).
+  `OPENROUTER_API_KEY`; skips politely without it);
+- [`examples/render-viewer.ts`](examples/render-viewer.ts) — render a manager +
+  sub-agent session to a self-contained HTML transcript viewer.
 
 ## Package map
 
@@ -184,6 +188,37 @@ node dist/examples/basic-agent.js
 
 The root import re-exports the portable public API. Node adapters are only
 available from the explicit `/node` subpath.
+
+## Transcript viewer
+
+Point the viewer at a session and it renders a self-contained, dependency-free
+HTML page from the raw logs — no server, opens locally:
+
+```ts
+import { renderSessionViewer } from "@sagapranav/harness-kernel/node";
+import { writeFile } from "node:fs/promises";
+
+const html = await renderSessionViewer(storage, sessionId);
+await writeFile("session-viewer.html", html);
+```
+
+It reads the journal, the immutable config, computed telemetry, and every
+sub-agent session, and produces three tabs:
+
+- **Overview** — pins the model configuration, the system prompt (agent
+  instructions), the tools, the initial user prompt, the aggregate telemetry
+  (tokens, cost, tool calls), and the final outcome.
+- **Transcript** — the readable conversation: user/assistant/tool messages,
+  tool calls and results, reasoning, inline images, and a per-turn telemetry
+  chip.
+- **Raw** — the underlying events as clean, per-event JSON.
+
+A session switcher and in-transcript links navigate into sub-agent
+(child-session) transcripts and back to the parent. Small image artifacts are
+inlined as data URLs so they render; large ones show a reference placeholder.
+`collectSessionBundle()` returns the same data as a plain object if you want to
+build your own view. The page is a disposable projection — the raw events
+remain authoritative.
 
 ## Core invariants
 
@@ -308,8 +343,13 @@ tool result stays text ("screenshot captured") and your handler relays the image
 as a following `user` message — where inlining turns it into a data-URL image
 part. If you skip resolution entirely, the encoders throw (or emit an explicit
 `[unencodable …]` placeholder under `{ unencodable: "describe" }`) rather than
-silently dropping the image. See [docs/STORAGE.md](docs/STORAGE.md) and
-[docs/PROVIDERS.md](docs/PROVIDERS.md).
+silently dropping the image.
+
+Images are sent as a real `image_url`/`input_image`, not base64 text, so the
+provider processes them as images. Pass `{ imageDetail: "low" }` to
+`toOpenAIChatInput`/`toOpenAIInput` to send a fixed low-resolution image when
+exact detail is not needed and image input tokens matter. See
+[docs/STORAGE.md](docs/STORAGE.md) and [docs/PROVIDERS.md](docs/PROVIDERS.md).
 
 ## Compaction
 

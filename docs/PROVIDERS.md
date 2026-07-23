@@ -82,6 +82,14 @@ Files follow the same reference model; there is no built-in provider mapping
 for file blocks yet, so they stay unencodable (or `describe` placeholders)
 until an application adapter encodes them.
 
+OpenAI bills image input by tiles, so a single image can cost a large number of
+input tokens at the default `auto` fidelity. The encoders send a proper
+`image_url`/`input_image` (not base64 text), whose token count responds to the
+`detail` field. Pass `{ imageDetail: "low" }` to the OpenAI encoders to send a
+fixed low-resolution image and reduce those tokens when exact detail is not
+needed; `"high"` forces full tiling. Anthropic has no equivalent knob, so
+`imageDetail` is ignored there.
+
 `toOpenAIChatInput()` emits the Chat Completions `messages` shape used by
 OpenRouter and most OpenAI-compatible endpoints: assistant tool calls become
 `tool_calls` entries with JSON-string arguments, and each canonical tool

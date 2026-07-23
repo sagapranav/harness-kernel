@@ -74,7 +74,7 @@ signatures live in the shipped source and `.d.ts` files.
 - `inlineArtifactBytes(messages, artifacts)` — resolve image/file `ArtifactRef`s to inline base64 (including images nested in tool results) so the encoders can emit a provider image payload; call it in a `ModelInvoker` before encoding.
 - `sseJsonEvents(byteStream)` — parse an SSE byte stream into JSON chunks (skips heartbeats, ends on `[DONE]`).
 - `createChatCompletionStreamAccumulator()` / `ChatCompletionStreamAccumulator` — fold OpenAI-style stream chunks into the complete response shape while emitting `ModelStreamEvent`s.
-- `ProviderEncodeOptions` — `unencodable: "throw" | "describe"` (explicit placeholder downgrade).
+- `ProviderEncodeOptions` — `unencodable: "throw" | "describe"` (explicit placeholder downgrade); `imageDetail: "auto" | "low" | "high"` sets OpenAI image fidelity (`"low"` ≈ 3× fewer image tokens; ignored by Anthropic).
 - `ProviderEncodingError` — thrown instead of silently dropping content.
 - `NormalizeProviderOptions`, `AnthropicInput` — option and result shapes.
 
@@ -130,3 +130,5 @@ signatures live in the shipped source and `.d.ts` files.
 - `createFileStorage(rootDirectory, runtime?)` — durable filesystem bundle.
 - `JsonlJournalStore` — one JSONL file per session; single instance per root; heals torn tails; O(1) cached appends.
 - `FileArtifactStore`, `FileProjectionStore`, `FileSessionCatalog` — filesystem ports.
+- `renderSessionViewer(storage, sessionId, options?)` — self-contained HTML transcript viewer (Overview / Transcript / Raw tabs, sub-agent navigation, inline images) for a session and its sub-agents.
+- `collectSessionBundle(storage, sessionId, options?)` / `ViewerBundle`, `ViewerSession`, `SessionViewerOptions` — the viewer's data as a plain object (sessions, telemetry, inlined images) for custom rendering.
