@@ -29,6 +29,10 @@
       "types": "./dist/src/conformance.d.ts",
       "import": "./dist/src/conformance.js"
     },
+    "./execution": {
+      "types": "./dist/src/execution.d.ts",
+      "import": "./dist/src/execution.js"
+    },
     "./json": {
       "types": "./dist/src/json.d.ts",
       "import": "./dist/src/json.js"
@@ -49,6 +53,10 @@
       "types": "./dist/src/loop.d.ts",
       "import": "./dist/src/loop.js"
     },
+    "./orchestration": {
+      "types": "./dist/src/orchestration.d.ts",
+      "import": "./dist/src/orchestration.js"
+    },
     "./sessions": {
       "types": "./dist/src/sessions.d.ts",
       "import": "./dist/src/sessions.js"
@@ -60,6 +68,10 @@
     "./telemetry": {
       "types": "./dist/src/telemetry.d.ts",
       "import": "./dist/src/telemetry.js"
+    },
+    "./work": {
+      "types": "./dist/src/work.d.ts",
+      "import": "./dist/src/work.js"
     },
     "./node": {
       "types": "./dist/src/node.d.ts",

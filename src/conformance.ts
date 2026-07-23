@@ -1,5 +1,10 @@
 import { ArtifactIntegrityError, type ArtifactStore } from "./artifacts.js";
 import {
+  bindExecutionLease,
+  ExecutionLeaseConflictError,
+  type FencedJournalStore,
+} from "./execution.js";
+import {
   JournalConflictError,
   validateChain,
   type JournalStore,
@@ -9,6 +14,12 @@ import type { ImmutableRunConfig, SessionDescriptor } from "./protocol.js";
 import { defaultRuntime, type RuntimeServices } from "./runtime.js";
 import type { SessionCatalog } from "./sessions.js";
 import type { HarnessStorage } from "./storage.js";
+import {
+  WorkItemConflictError,
+  WorkLeaseConflictError,
+  type WorkItem,
+  type WorkQueue,
+} from "./work.js";
 
 export interface ConformanceCheck {
   scope:
@@ -17,7 +28,9 @@ export interface ConformanceCheck {
     | "journal"
     | "artifacts"
     | "projections"
-    | "sessions";
+    | "sessions"
+    | "work"
+    | "execution";
   name: string;
   passed: boolean;
   error?: string;
@@ -38,6 +51,24 @@ export class StorageConformanceError extends Error {
         .join("; ")}`,
     );
     this.name = "StorageConformanceError";
+  }
+}
+
+export interface OrchestrationConformanceReport {
+  adapter: string;
+  passed: boolean;
+  checks: ConformanceCheck[];
+}
+
+export class OrchestrationConformanceError extends Error {
+  constructor(readonly report: OrchestrationConformanceReport) {
+    super(
+      `orchestration conformance failed for ${report.adapter}: ${report.checks
+        .filter((check) => !check.passed)
+        .map((check) => `${check.scope}/${check.name}: ${check.error}`)
+        .join("; ")}`,
+    );
+    this.name = "OrchestrationConformanceError";
   }
 }
 
@@ -383,6 +414,330 @@ export async function checkSessionCatalog(
 }
 
 /**
+ * Runs idempotent submission, routing, lease, retry, continuation, and
+ * defensive-copy checks against a fresh queue namespace.
+ */
+export async function checkWorkQueue(
+  queue: WorkQueue,
+  runtime: RuntimeServices = defaultRuntime,
+): Promise<ConformanceCheck[]> {
+  const checks: ConformanceCheck[] = [];
+  const prefix = runtime.createId("work_conformance");
+  const createdAt = runtime.nowIso();
+  const item = (
+    suffix: string,
+    overrides: Partial<WorkItem> = {},
+  ): WorkItem => ({
+    id: `${prefix}_${suffix}`,
+    sessionId: `${prefix}_session_${suffix}`,
+    kind: `${prefix}.kind.${suffix}`,
+    createdAt,
+    requiredCapabilities: [`${prefix}.agent`],
+    policy: { maxAttempts: 2, maxContinuations: 1 },
+    metadata: { value: 1 },
+    ...overrides,
+  });
+
+  await check(
+    checks,
+    "work",
+    "enqueue is immutable and idempotent",
+    async () => {
+      const original = item("enqueue");
+      const mutable = {
+        ...original,
+        metadata: { value: 1 },
+      };
+      const pending = queue.enqueue(mutable);
+      mutable.metadata.value = 9;
+      await pending;
+      requireCondition(
+        (await queue.get(original.id))?.item.metadata?.value === 1,
+        "enqueue retained caller mutation",
+      );
+      await queue.enqueue(original);
+      let conflict: unknown;
+      try {
+        await queue.enqueue({ ...original, kind: `${original.kind}.changed` });
+      } catch (error) {
+        conflict = error;
+      }
+      requireCondition(
+        conflict instanceof WorkItemConflictError,
+        "conflicting enqueue did not throw WorkItemConflictError",
+      );
+    },
+  );
+
+  await check(checks, "work", "claims route and are exclusive", async () => {
+    const routed = item("route", {
+      requiredCapabilities: [`${prefix}.agent`, `${prefix}.browser`],
+    });
+    await queue.enqueue(routed);
+    const wrong = await queue.claim({
+      workerId: `${prefix}_wrong`,
+      capabilities: [`${prefix}.agent`],
+      kinds: [routed.kind],
+      visibilityTimeoutMs: 60_000,
+    });
+    requireCondition(wrong === null, "capability routing was ignored");
+    const competing = await Promise.all(
+      [`${prefix}_browser_1`, `${prefix}_browser_2`].map((workerId) =>
+        queue.claim({
+          workerId,
+          capabilities: [`${prefix}.agent`, `${prefix}.browser`],
+          kinds: [routed.kind],
+          visibilityTimeoutMs: 60_000,
+        }),
+      ),
+    );
+    const claimed = competing.filter((lease) => lease !== null);
+    requireCondition(
+      claimed.length === 1,
+      "concurrent claim was not exclusive",
+    );
+    const lease = claimed[0]!;
+    requireCondition(
+      (await queue.claim({
+        workerId: `${prefix}_second`,
+        capabilities: [`${prefix}.agent`, `${prefix}.browser`],
+        kinds: [routed.kind],
+        visibilityTimeoutMs: 60_000,
+      })) === null,
+      "leased delivery was claimed again",
+    );
+    const completed = await queue.complete(lease, { result: { ok: true } });
+    requireCondition(
+      completed.state === "completed",
+      "completion was not terminal",
+    );
+    let stale: unknown;
+    try {
+      await queue.complete(lease);
+    } catch (error) {
+      stale = error;
+    }
+    requireCondition(
+      stale instanceof WorkLeaseConflictError,
+      "stale completion did not throw WorkLeaseConflictError",
+    );
+  });
+
+  await check(checks, "work", "retries exhaust into dead letter", async () => {
+    const retry = item("retry");
+    await queue.enqueue(retry);
+    const first = await queue.claim({
+      workerId: `${prefix}_retry_1`,
+      capabilities: [`${prefix}.agent`],
+      kinds: [retry.kind],
+      visibilityTimeoutMs: 60_000,
+    });
+    requireCondition(first !== null, "first retry delivery was absent");
+    requireCondition(
+      (
+        await queue.fail(first, {
+          message: "transient",
+          retryable: true,
+        })
+      ).state === "queued",
+      "retryable first failure was not requeued",
+    );
+    const second = await queue.claim({
+      workerId: `${prefix}_retry_2`,
+      capabilities: [`${prefix}.agent`],
+      kinds: [retry.kind],
+      visibilityTimeoutMs: 60_000,
+    });
+    requireCondition(second !== null, "second retry delivery was absent");
+    requireCondition(second.attempt === 2, "delivery attempt did not advance");
+    requireCondition(
+      (
+        await queue.fail(second, {
+          message: "still broken",
+          retryable: true,
+        })
+      ).state === "dead_lettered",
+      "retry exhaustion did not dead-letter work",
+    );
+  });
+
+  await check(
+    checks,
+    "work",
+    "continuations reset delivery attempts and are bounded",
+    async () => {
+      const continuation = item("continuation");
+      await queue.enqueue(continuation);
+      const first = await queue.claim({
+        workerId: `${prefix}_continuation_1`,
+        capabilities: [`${prefix}.agent`],
+        kinds: [continuation.kind],
+        visibilityTimeoutMs: 60_000,
+      });
+      requireCondition(
+        first !== null,
+        "first continuation delivery was absent",
+      );
+      const queued = await queue.checkpoint(first, {
+        reason: "bounded host deadline",
+      });
+      requireCondition(
+        queued.state === "queued",
+        "checkpoint was not requeued",
+      );
+      requireCondition(
+        queued.attempt === 0,
+        "checkpoint did not reset attempts",
+      );
+      requireCondition(
+        queued.continuationCount === 1,
+        "continuation counter did not advance",
+      );
+      const second = await queue.claim({
+        workerId: `${prefix}_continuation_2`,
+        capabilities: [`${prefix}.agent`],
+        kinds: [continuation.kind],
+        visibilityTimeoutMs: 60_000,
+      });
+      requireCondition(second !== null, "continued delivery was absent");
+      requireCondition(
+        (await queue.checkpoint(second, { reason: "limit" })).state ===
+          "dead_lettered",
+        "continuation exhaustion did not dead-letter work",
+      );
+    },
+  );
+
+  return checks;
+}
+
+/**
+ * Runs exclusivity and stale-writer fencing checks. Distributed adapters must
+ * enforce the token in the same transaction as append.
+ */
+export async function checkFencedJournalStore(
+  journal: FencedJournalStore,
+  runtime: RuntimeServices = defaultRuntime,
+): Promise<ConformanceCheck[]> {
+  const checks: ConformanceCheck[] = [];
+  const sessionId = runtime.createId("execution_conformance");
+  const firstOwner = runtime.createId("worker");
+  const secondOwner = runtime.createId("worker");
+  let replacementOwner = secondOwner;
+  let firstLease:
+    | Awaited<ReturnType<FencedJournalStore["acquireExecutionLease"]>>
+    | undefined;
+
+  await check(
+    checks,
+    "execution",
+    "execution ownership is exclusive",
+    async () => {
+      const competing = await Promise.all(
+        [firstOwner, secondOwner].map((ownerId) =>
+          journal.acquireExecutionLease({
+            sessionId,
+            ownerId,
+            durationMs: 60_000,
+          }),
+        ),
+      );
+      const acquired = competing.filter((lease) => lease !== null);
+      requireCondition(
+        acquired.length === 1,
+        "concurrent execution lease acquisition was not exclusive",
+      );
+      firstLease = acquired[0]!;
+      replacementOwner =
+        firstLease.ownerId === firstOwner ? secondOwner : firstOwner;
+    },
+  );
+
+  await check(
+    checks,
+    "execution",
+    "fenced append rejects old owner",
+    async () => {
+      requireCondition(firstLease != null, "first lease was not acquired");
+      const firstView = bindExecutionLease(journal, firstLease);
+      await firstView.append(
+        sessionId,
+        {
+          category: "control",
+          type: "conformance.execution.first",
+          data: {},
+        },
+        { expectedHeadId: null },
+      );
+      await journal.releaseExecutionLease(firstLease);
+      const secondLease = await journal.acquireExecutionLease({
+        sessionId,
+        ownerId: replacementOwner,
+        durationMs: 60_000,
+      });
+      requireCondition(
+        secondLease !== null,
+        "second owner could not acquire lease",
+      );
+      requireCondition(
+        secondLease.fencingToken > firstLease.fencingToken,
+        "fencing token did not increase",
+      );
+      let stale: unknown;
+      try {
+        await firstView.append(sessionId, {
+          category: "trace",
+          type: "conformance.execution.stale",
+          data: {},
+        });
+      } catch (error) {
+        stale = error;
+      }
+      requireCondition(
+        stale instanceof ExecutionLeaseConflictError,
+        "stale writer did not throw ExecutionLeaseConflictError",
+      );
+      await bindExecutionLease(journal, secondLease).append(sessionId, {
+        category: "control",
+        type: "conformance.execution.second",
+        data: {},
+      });
+      const events = await journal.read(sessionId);
+      validateChain(sessionId, events);
+      requireCondition(events.length === 2, "stale writer changed the journal");
+    },
+  );
+
+  return checks;
+}
+
+export interface CheckOrchestrationOptions {
+  adapter: string;
+  queue: WorkQueue;
+  journal?: FencedJournalStore;
+  runtime?: RuntimeServices;
+}
+
+/**
+ * Run against fresh adapter namespaces. Checks intentionally create work,
+ * leases, and journal events.
+ */
+export async function checkOrchestration(
+  options: CheckOrchestrationOptions,
+): Promise<OrchestrationConformanceReport> {
+  const runtime = options.runtime ?? defaultRuntime;
+  const checks = await checkWorkQueue(options.queue, runtime);
+  if (options.journal !== undefined) {
+    checks.push(...(await checkFencedJournalStore(options.journal, runtime)));
+  }
+  return {
+    adapter: options.adapter,
+    passed: checks.every((item) => item.passed),
+    checks,
+  };
+}
+
+/**
  * Run against a fresh adapter namespace. The checks intentionally write test
  * records and are suitable for CI, staging, or disposable local stores.
  */
@@ -433,4 +788,10 @@ export function assertStorageConformance(
   report: StorageConformanceReport,
 ): void {
   if (!report.passed) throw new StorageConformanceError(report);
+}
+
+export function assertOrchestrationConformance(
+  report: OrchestrationConformanceReport,
+): void {
+  if (!report.passed) throw new OrchestrationConformanceError(report);
 }

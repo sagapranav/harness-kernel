@@ -135,3 +135,15 @@ determinism is required.
 
 Runtime services must not contain secrets and must not silently weaken SHA-256
 content addressing.
+
+## Operational execution state
+
+The work queue is intentionally not a fifth `HarnessStorage` port. Queue
+delivery attempts, visibility leases, continuations, and dead-letter state are
+operational execution state with different consistency and lifecycle needs.
+Use `WorkQueue` for that plane.
+
+Multi-machine workers also need `FencedJournalStore`. Queue fencing prevents a
+stale acknowledgement; journal fencing prevents a stale process from writing
+semantic history after another worker owns the session. See
+[ORCHESTRATION.md](ORCHESTRATION.md).

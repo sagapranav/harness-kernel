@@ -1,8 +1,10 @@
 export * from "./artifacts.js";
 export * from "./conformance.js";
+export * from "./execution.js";
 export * from "./json.js";
 export * from "./journal.js";
 export * from "./loop.js";
+export * from "./orchestration.js";
 export * from "./projection.js";
 export * from "./protocol.js";
 export * from "./providers.js";
@@ -10,3 +12,4 @@ export * from "./runtime.js";
 export * from "./sessions.js";
 export * from "./storage.js";
 export * from "./telemetry.js";
+export * from "./work.js";

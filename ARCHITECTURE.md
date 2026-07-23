@@ -5,7 +5,7 @@
 Harness Kernel owns durable semantic contracts. An application owns its models,
 tools, policy, credentials, workflow topology, user experience, and deployment.
 
-The library is organized around five runtime objects:
+The semantic core is organized around five runtime objects:
 
 1. **Policy:** an injected `ModelInvoker`.
 2. **Log:** an injected `JournalStore`.
@@ -14,6 +14,14 @@ The library is organized around five runtime objects:
 5. **Host services:** injected identity, time, hashing, and storage ports.
 
 Everything else is a transformation around those objects.
+
+For asynchronous or distributed execution, a second plane adds:
+
+6. **Dispatch:** an injected `WorkQueue`.
+7. **Worker boundary:** a bounded `WorkerHost`.
+8. **Ownership:** a queue visibility lease plus a journal fencing lease.
+
+These are execution contracts, not a prescribed scheduler or cloud.
 
 ## State layers
 
@@ -81,6 +89,36 @@ config/session puts remain immutable.
 Policy, retry strategy, approvals, sandboxing, provider streaming, retrieval,
 and UI broadcasting remain outside this function.
 
+`beforeTurn` lets a host renew queue and session leases. `shouldCheckpoint`
+lets a bounded runtime stop before its deadline and continue from durable
+history in another process.
+
+## Execution plane
+
+`WorkQueue` defines at-least-once work submission, capability routing,
+visibility leases, heartbeats, retries, dead-lettering, and bounded
+continuations. Queue state is operational state; it is not a replacement for
+the semantic journal.
+
+Retries repeat a failed delivery segment. Continuations begin a new segment
+after a successful checkpoint. Each has an independent limit.
+
+`WorkerHost` processes one delivery. Polling, concurrency, autoscaling, and
+process lifecycle stay in the CLI, service, workflow activity, or serverless
+host.
+
+Queue fencing prevents stale acknowledgement but cannot by itself stop an
+expired process from writing the session. `FencedJournalStore` therefore
+provides an independent execution lease whose monotonically increasing token
+must be checked atomically with every append. `bindExecutionLease()` presents
+that guarantee through the ordinary `JournalStore` interface consumed by the
+loop.
+
+`SessionWorkDispatcher` connects child journals to the queue with a
+deterministic work ID. Cross-system atomicity remains an application concern;
+durable APIs should use a transactional outbox when session creation and queue
+submission use different systems.
+
 ## Forks
 
 A child session contains:
@@ -126,8 +164,8 @@ a false transcript and is never an acceptable compatibility strategy.
 
 ## Non-goals
 
-- Durable DAG scheduling
-- Distributed locks
+- A prescribed durable DAG scheduler or workflow language
+- A prescribed queue, lock service, database, or cloud
 - Credential vaults
 - Approval UX
 - Provider SDK lifecycle

@@ -65,7 +65,19 @@ execution and then use the same deterministic journal.
 
 ## Add distributed child workers
 
-Persist the child descriptor before scheduling work. Treat `child.started` as
-the durable handoff and make worker acquisition idempotent by child session ID.
-The returning worker should write its own journal and submit one `ChildResult`
-to the parent.
+Persist the child descriptor before scheduling work. Use
+`SessionWorkDispatcher` so repeated dispatch is idempotent by child session ID.
+For an API spanning a database and external queue, use a transactional outbox
+to close the create/enqueue gap.
+
+Implement `WorkQueue` for capability routing, visibility leases, retries,
+continuations, and dead-lettering. Implement `FencedJournalStore` so a stale
+worker cannot append after ownership transfers. Run `checkOrchestration()`
+against isolated adapter namespaces.
+
+The returning worker writes its own journal and submits one `ChildResult` to the
+parent. Retry and continuation counters remain in queue state; the semantic
+journal retains model/action/run history.
+
+See [ORCHESTRATION.md](ORCHESTRATION.md) for single-CLI, serverless, and
+multi-machine compositions.

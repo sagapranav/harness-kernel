@@ -11,7 +11,8 @@ Read:
 3. `docs/EVENTS.md`
 4. `docs/PROVIDERS.md` when changing provider behavior
 5. `docs/STORAGE.md` when changing runtime or persistence behavior
-6. the module you intend to change
+6. `docs/ORCHESTRATION.md` when changing queues, workers, leases, or deployment
+7. the module you intend to change
 
 Run `npm run check` before and after any behavioral change.
 
@@ -29,6 +30,10 @@ Run `npm run check` before and after any behavioral change.
 - Never import Node built-ins from the portable root dependency graph.
 - Never claim an adapter is durable or distributed without declaring its
   `StorageProfile` and running the storage conformance suite.
+- Never treat queue acknowledgement fencing as session-writer fencing.
+- Never implement a distributed journal lease as a check-then-append race; the
+  fencing token and append must be one atomic operation.
+- Never conflate a failed delivery retry with a successful host continuation.
 
 ## How to reuse the library in another harness
 
@@ -44,6 +49,10 @@ Run `npm run check` before and after any behavioral change.
 9. Materialize UI, telemetry, and search views with projections.
 10. Use `SessionManager.fork()` only when a separate context window buys
     isolation or independent evidence.
+11. For asynchronous work, dispatch immutable session references through
+    `WorkQueue` and qualify the adapter with `checkOrchestration()`.
+12. For multi-machine execution, pass a `bindExecutionLease()` journal view to
+    the loop and renew queue plus journal leases before each turn.
 
 ## Adding a provider
 
@@ -74,5 +83,6 @@ Run `npm run check` before and after any behavioral change.
 - [ ] Public APIs and examples are updated.
 - [ ] Portable imports do not reach Node-only modules.
 - [ ] Storage/runtime adapter changes pass conformance tests.
+- [ ] Work queue and fenced-journal changes pass orchestration conformance.
 - [ ] `npm run check` passes.
 - [ ] `npm run pack:check` contains the expected public files.

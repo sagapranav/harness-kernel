@@ -13,6 +13,9 @@ agents, scheduled agents, and deterministic multi-agent workflows:
 - canonical messages and telemetry with OpenAI and Anthropic adapters;
 - a small provider-neutral agent loop;
 - first-class child journals with inherited-context projection;
+- a provider-neutral work queue, worker host, continuations, retries, and DLQ
+  semantics;
+- fenced single-writer execution leases for distributed session journals;
 - action receipts, idempotency, evidence, and explicit absence semantics.
 
 It does **not** prescribe a tool catalog, model SDK, database, UI, workflow
@@ -21,23 +24,15 @@ engine, sandbox, or policy system.
 ## The model
 
 ```text
-Provider response
-      │
-      ▼
-Provider adapter ──→ canonical message + telemetry
-      │
-      ▼
-Flat agent loop ───→ action executor
-      │                    │
-      └──── append events ◀┘
-                 │
-                 ▼
-         immutable raw journal ───→ content-addressed artifacts
-                 │
-        ┌────────┼───────────────┐
-        ▼        ▼               ▼
-    context   cold views     audit/evals
-   projection
+API / CLI ──→ work queue ──→ worker host ──→ browser / sandbox / tools
+                  │               │
+            retry + lease     fenced session writer
+                                  │
+Provider adapter ──→ flat agent loop ──→ immutable raw journal
+       │                                      │
+       └─ canonical message + telemetry       ├─→ artifacts
+                                              ├─→ context
+                                              └─→ cold views / audit / evals
 ```
 
 The raw journal is authoritative. Context, compaction, UI state, telemetry,
@@ -131,7 +126,8 @@ const outcome = await runAgentLoop({
 
 See [`examples/basic-agent.ts`](examples/basic-agent.ts) for a runnable
 dependency-free example and [`examples/forked-review.ts`](examples/forked-review.ts)
-for child-session semantics.
+for child-session semantics. [`examples/manager-workers.ts`](examples/manager-workers.ts)
+shows a Claude-configured manager dispatching a capability-routed child worker.
 
 ## Package map
 
@@ -139,12 +135,15 @@ for child-session semantics.
 | ------------------------------------- | ---------------------------------------------------------- |
 | `@sagapranav/harness-kernel/protocol` | Canonical messages, events, configs, receipts and evidence |
 | `…/journal`                           | Portable journal contract and memory implementation        |
+| `…/execution`                         | Fenced single-writer leases for distributed journals       |
 | `…/artifacts`                         | Portable artifact contract and memory implementation       |
-| `…/conformance`                       | Reusable storage-adapter contract checks                   |
+| `…/conformance`                       | Reusable storage and execution-adapter contract checks     |
 | `…/json`                              | Durable JSON validation and defensive cloning              |
 | `…/projection`                        | Context folds, compaction events and cold projections      |
 | `…/providers`                         | OpenAI/Anthropic normalization and outbound encoding       |
 | `…/loop`                              | The flat model → tools → model loop                        |
+| `…/work`                              | Work queue, leases, retries, continuations and worker host |
+| `…/orchestration`                     | Idempotent session and child-run dispatch                  |
 | `…/runtime`                           | Injectable identity, time, and SHA-256 host services       |
 | `…/sessions`                          | Immutable configs, sessions, forks and inherited context   |
 | `…/storage`                           | Complete storage bundles and operational profiles          |
@@ -168,6 +167,9 @@ available from the explicit `/node` subpath.
 9. **Unknown event types survive reads.**
 10. **Cold projections are disposable.** They can always be rebuilt from raw
     events and artifacts.
+11. **Queue delivery is at least once.** Retries and continuations are distinct.
+12. **One distributed worker owns a session journal at a time.** A stale writer
+    is rejected by an atomic fencing token, not merely a liveness check.
 
 ## Compaction
 
@@ -224,16 +226,18 @@ const storage = createFileStorage("./harness-data");
 ```
 
 For SQLite, Postgres, object storage, browser storage, workers, or a distributed
-runtime, implement the four small persistence ports and run
-`checkHarnessStorage()` against an isolated adapter namespace. Runtime-created
-IDs, timestamps, and SHA-256 hashing are also injectable through
-`RuntimeServices`.
+runtime, implement the small persistence and execution ports. Run
+`checkHarnessStorage()` and `checkOrchestration()` against isolated adapter
+namespaces. Runtime-created IDs, timestamps, and SHA-256 hashing are also
+injectable through `RuntimeServices`.
 
 `JsonlJournalStore` remains single-instance. Multiple writers require a
 transactional journal implementation with atomic expected-head comparison.
 
 Read [ARCHITECTURE.md](ARCHITECTURE.md) before extending the event model and
 [docs/STORAGE.md](docs/STORAGE.md) before implementing a storage/runtime adapter.
+Read [docs/ORCHESTRATION.md](docs/ORCHESTRATION.md) before building a manager,
+CLI worker pool, queue adapter, or multi-machine deployment.
 Read [docs/PROVIDERS.md](docs/PROVIDERS.md) before writing a provider adapter.
 Use
 [AGENTS.md](AGENTS.md) when asking an implementation agent to adopt the library.

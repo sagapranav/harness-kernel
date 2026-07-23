@@ -44,6 +44,13 @@ export interface AgentLoopOptions {
   actions: ActionExecutor;
   signal?: AbortSignal;
   maxTurns?: number;
+  /** Host hook for renewing queue/session leases before every bounded turn. */
+  beforeTurn?: () => Promise<void>;
+  /**
+   * Graceful host deadline hook. Return a reason before a new turn to persist a
+   * checkpointed outcome that a queue worker may continue in another process.
+   */
+  shouldCheckpoint?: () => string | null;
   /** Host identity/time services; inject for deterministic or non-default runtimes. */
   runtime?: RuntimeServices;
   /**
@@ -558,6 +565,18 @@ export async function runAgentLoop(
     if (options.signal?.aborted === true) {
       return appendOutcome(options, { status: "cancelled", turns });
     }
+    const checkpointReason = options.shouldCheckpoint?.() ?? null;
+    if (checkpointReason !== null) {
+      if (checkpointReason.length === 0) {
+        throw new TypeError("checkpoint reason must not be empty");
+      }
+      return appendOutcome(options, {
+        status: "checkpointed",
+        turns,
+        reason: checkpointReason,
+      });
+    }
+    await options.beforeTurn?.();
 
     turns += 1;
     const turnId = runtime.createId("turn");
