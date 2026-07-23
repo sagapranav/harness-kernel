@@ -10,7 +10,8 @@ Read:
 2. `ARCHITECTURE.md`
 3. `docs/EVENTS.md`
 4. `docs/PROVIDERS.md` when changing provider behavior
-5. the module you intend to change
+5. `docs/STORAGE.md` when changing runtime or persistence behavior
+6. the module you intend to change
 
 Run `npm run check` before and after any behavioral change.
 
@@ -25,19 +26,24 @@ Run `npm run check` before and after any behavioral change.
 - Never make absence impossible to represent.
 - Never add a runtime dependency when a small interface is sufficient without
   explaining the tradeoff in `ARCHITECTURE.md`.
+- Never import Node built-ins from the portable root dependency graph.
+- Never claim an adapter is durable or distributed without declaring its
+  `StorageProfile` and running the storage conformance suite.
 
 ## How to reuse the library in another harness
 
 1. Implement or choose a `JournalStore`.
-2. Store one immutable `ImmutableRunConfig` per configuration version.
-3. Normalize provider output into `NormalizedModelResponse`.
-4. Wrap every tool surface behind `ActionExecutor`.
-5. Append user observations with `messageEvent()`.
-6. Pass an application-specific context projector to `runAgentLoop()` when
+2. Choose the remaining artifact, projection, and session catalog ports.
+3. Run `checkHarnessStorage()` against an isolated adapter namespace.
+4. Store one immutable `ImmutableRunConfig` per configuration version.
+5. Normalize provider output into `NormalizedModelResponse`.
+6. Wrap every tool surface behind `ActionExecutor`.
+7. Append user observations with `messageEvent()`.
+8. Pass an application-specific context projector to `runAgentLoop()` when
    retrieval or inherited state is needed.
-7. Materialize UI, telemetry, and search views with projections.
-8. Use `SessionManager.fork()` only when a separate context window buys
-   isolation or independent evidence.
+9. Materialize UI, telemetry, and search views with projections.
+10. Use `SessionManager.fork()` only when a separate context window buys
+    isolation or independent evidence.
 
 ## Adding a provider
 
@@ -66,5 +72,7 @@ Run `npm run check` before and after any behavioral change.
 - [ ] Child results can express no findings.
 - [ ] Provider-native semantics are not flattened unnecessarily.
 - [ ] Public APIs and examples are updated.
+- [ ] Portable imports do not reach Node-only modules.
+- [ ] Storage/runtime adapter changes pass conformance tests.
 - [ ] `npm run check` passes.
 - [ ] `npm run pack:check` contains the expected public files.

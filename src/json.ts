@@ -100,7 +100,7 @@ export function assertJsonSerializable(value: unknown, path = "$"): void {
 
 export function cloneJson<T>(value: T): T {
   assertJsonSerializable(value);
-  return structuredClone(value);
+  return JSON.parse(JSON.stringify(value)) as T;
 }
 
 /** Stable JSON encoding for semantic equality and content hashing. */

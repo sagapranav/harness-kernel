@@ -6,12 +6,11 @@ import test from "node:test";
 import { createHash } from "node:crypto";
 import {
   ArtifactIntegrityError,
-  FileArtifactStore,
   JournalConflictError,
-  JsonlJournalStore,
   MemoryArtifactStore,
   MemoryJournalStore,
 } from "../src/index.js";
+import { FileArtifactStore, JsonlJournalStore } from "../src/node.js";
 
 test("memory journal creates a linear causal chain and enforces expected heads", async () => {
   const store = new MemoryJournalStore();

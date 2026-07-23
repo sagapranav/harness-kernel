@@ -9,6 +9,7 @@ agents, scheduled agents, and deterministic multi-agent workflows:
 - an immutable, causally linked event journal;
 - pure context and cold projections over that journal;
 - content-addressed artifact offloading;
+- portable storage/runtime ports with reusable adapter conformance checks;
 - canonical messages and telemetry with OpenAI and Anthropic adapters;
 - a small provider-neutral agent loop;
 - first-class child journals with inherited-context projection;
@@ -48,7 +49,8 @@ search indexes, and child summaries are replaceable projections.
 npm install github:sagapranav/harness-kernel
 ```
 
-The package has no runtime dependencies and requires Node.js 20 or newer.
+The package has no runtime dependencies. The portable core requires ES2022 and
+Web Crypto; `@sagapranav/harness-kernel/node` requires Node.js 20 or newer.
 The package name is reserved as `@sagapranav/harness-kernel` if it is later
 published to npm.
 
@@ -136,16 +138,21 @@ for child-session semantics.
 | Import                                | Responsibility                                             |
 | ------------------------------------- | ---------------------------------------------------------- |
 | `@sagapranav/harness-kernel/protocol` | Canonical messages, events, configs, receipts and evidence |
-| `…/journal`                           | In-memory and fsynced JSONL append-only stores             |
-| `…/artifacts`                         | In-memory and filesystem content-addressed blobs           |
+| `…/journal`                           | Portable journal contract and memory implementation        |
+| `…/artifacts`                         | Portable artifact contract and memory implementation       |
+| `…/conformance`                       | Reusable storage-adapter contract checks                   |
 | `…/json`                              | Durable JSON validation and defensive cloning              |
 | `…/projection`                        | Context folds, compaction events and cold projections      |
 | `…/providers`                         | OpenAI/Anthropic normalization and outbound encoding       |
 | `…/loop`                              | The flat model → tools → model loop                        |
+| `…/runtime`                           | Injectable identity, time, and SHA-256 host services       |
 | `…/sessions`                          | Immutable configs, sessions, forks and inherited context   |
+| `…/storage`                           | Complete storage bundles and operational profiles          |
 | `…/telemetry`                         | Rebuildable aggregate usage and action metrics             |
+| `…/node`                              | Node-only filesystem adapters and bundle factory           |
 
-The root import re-exports every public symbol.
+The root import re-exports the portable public API. Node adapters are only
+available from the explicit `/node` subpath.
 
 ## Core invariants
 
@@ -197,19 +204,38 @@ they never silently discard a canonical block.
 Adding another provider should require a new adapter, not a journal migration.
 The `provider` field is therefore an extensible string.
 
-## Production adaptation
+## Storage and runtime adaptation
 
-The included memory and filesystem stores are reference implementations. For a
-distributed runtime, implement the small `JournalStore`, `ArtifactStore`,
-`ProjectionStore`, and `SessionCatalog` interfaces over your own database or
-object store. Preserve optimistic head checks and per-session append
-linearization. `JsonlJournalStore` serializes one in-process store instance; do
-not point multiple processes or multiple store instances at the same directory.
-Filesystem implementations hash application identifiers into bounded path
-components, so IDs do not need filesystem-safe syntax.
+The portable root never loads Node built-ins. Use the complete in-memory bundle
+for transient work:
+
+```ts
+import { createMemoryStorage } from "@sagapranav/harness-kernel";
+
+const storage = createMemoryStorage();
+```
+
+Node applications can opt into the durable filesystem reference bundle:
+
+```ts
+import { createFileStorage } from "@sagapranav/harness-kernel/node";
+
+const storage = createFileStorage("./harness-data");
+```
+
+For SQLite, Postgres, object storage, browser storage, workers, or a distributed
+runtime, implement the four small persistence ports and run
+`checkHarnessStorage()` against an isolated adapter namespace. Runtime-created
+IDs, timestamps, and SHA-256 hashing are also injectable through
+`RuntimeServices`.
+
+`JsonlJournalStore` remains single-instance. Multiple writers require a
+transactional journal implementation with atomic expected-head comparison.
 
 Read [ARCHITECTURE.md](ARCHITECTURE.md) before extending the event model and
-[docs/PROVIDERS.md](docs/PROVIDERS.md) before writing an adapter. Use
+[docs/STORAGE.md](docs/STORAGE.md) before implementing a storage/runtime adapter.
+Read [docs/PROVIDERS.md](docs/PROVIDERS.md) before writing a provider adapter.
+Use
 [AGENTS.md](AGENTS.md) when asking an implementation agent to adopt the library.
 
 ## Development

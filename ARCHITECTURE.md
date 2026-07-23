@@ -5,12 +5,13 @@
 Harness Kernel owns durable semantic contracts. An application owns its models,
 tools, policy, credentials, workflow topology, user experience, and deployment.
 
-The library is organized around four runtime objects:
+The library is organized around five runtime objects:
 
 1. **Policy:** an injected `ModelInvoker`.
 2. **Log:** an injected `JournalStore`.
 3. **Action surface:** an injected `ActionExecutor`.
 4. **Environment:** whatever the action executor operates.
+5. **Host services:** injected identity, time, hashing, and storage ports.
 
 Everything else is a transformation around those objects.
 
@@ -47,6 +48,22 @@ change.
 
 The model-facing context is one projection. Compaction changes that projection
 by adding a `context.compacted` event; it does not replace earlier events.
+
+## Runtime and storage boundary
+
+Portable modules contain no Node built-ins. Identity, timestamps, and SHA-256
+hashing come from `RuntimeServices`. Persistence comes from four capability
+ports: `JournalStore`, `ArtifactStore`, `ProjectionStore`, and
+`SessionCatalog`.
+
+The Node filesystem implementations live behind the explicit `/node` package
+subpath. Database, object-store, browser, edge, and remote-service adapters can
+implement the same ports without changing events, projections, or the loop.
+
+The interface is not the complete guarantee. Adapter implementations must pass
+the reusable conformance suite. In particular, journal expected-head comparison
+and append are one atomic operation; projection storage remains disposable; and
+config/session puts remain immutable.
 
 ## Loop
 

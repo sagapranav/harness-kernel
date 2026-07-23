@@ -1,14 +1,5 @@
-import { createHash, randomUUID } from "node:crypto";
-import {
-  link,
-  mkdir,
-  readFile,
-  stat,
-  unlink,
-  writeFile,
-} from "node:fs/promises";
-import { join } from "node:path";
 import type { ArtifactRef } from "./protocol.js";
+import { defaultRuntime, type RuntimeServices } from "./runtime.js";
 
 export interface PutArtifactOptions {
   mediaType?: string;
@@ -16,11 +7,16 @@ export interface PutArtifactOptions {
 }
 
 export interface ArtifactStore {
+  /**
+   * Persist bytes under their SHA-256 digest. Repeated puts of the same bytes
+   * must be idempotent and must not alter existing content.
+   */
   put(
     value: Uint8Array | string,
     options?: PutArtifactOptions,
   ): Promise<ArtifactRef>;
   get(ref: ArtifactRef): Promise<Uint8Array>;
+  /** Test content-address existence without returning mutable store state. */
   has(ref: ArtifactRef): Promise<boolean>;
 }
 
@@ -50,17 +46,23 @@ export function assertArtifactRef(ref: ArtifactRef): void {
   }
 }
 
-function bytes(value: Uint8Array | string): Uint8Array {
+export function artifactBytes(value: Uint8Array | string): Uint8Array {
   return typeof value === "string"
     ? new TextEncoder().encode(value)
     : new Uint8Array(value);
 }
 
-function reference(
+export async function artifactReference(
   value: Uint8Array,
   options?: PutArtifactOptions,
-): ArtifactRef {
-  const sha256 = createHash("sha256").update(value).digest("hex");
+  runtime: RuntimeServices = defaultRuntime,
+): Promise<ArtifactRef> {
+  const sha256 = await runtime.sha256(value);
+  if (!/^[a-f0-9]{64}$/.test(sha256)) {
+    throw new TypeError(
+      "runtime sha256 must return 64 lowercase hexadecimal characters",
+    );
+  }
   return {
     sha256,
     uri: `sha256:${sha256}`,
@@ -73,12 +75,14 @@ function reference(
 export class MemoryArtifactStore implements ArtifactStore {
   private readonly values = new Map<string, Uint8Array>();
 
+  constructor(readonly runtime: RuntimeServices = defaultRuntime) {}
+
   async put(
     value: Uint8Array | string,
     options?: PutArtifactOptions,
   ): Promise<ArtifactRef> {
-    const data = bytes(value);
-    const ref = reference(data, options);
+    const data = artifactBytes(value);
+    const ref = await artifactReference(data, options, this.runtime);
     this.values.set(ref.sha256, new Uint8Array(data));
     return ref;
   }
@@ -94,67 +98,5 @@ export class MemoryArtifactStore implements ArtifactStore {
   async has(ref: ArtifactRef): Promise<boolean> {
     assertArtifactRef(ref);
     return this.values.has(ref.sha256);
-  }
-}
-
-/** Content-addressed filesystem storage with atomic, idempotent writes. */
-export class FileArtifactStore implements ArtifactStore {
-  constructor(readonly rootDirectory: string) {}
-
-  async put(
-    value: Uint8Array | string,
-    options?: PutArtifactOptions,
-  ): Promise<ArtifactRef> {
-    const data = bytes(value);
-    const ref = reference(data, options);
-    const path = this.pathFor(ref);
-    await mkdir(join(this.rootDirectory, ref.sha256.slice(0, 2)), {
-      recursive: true,
-    });
-    if (await this.has(ref)) {
-      await this.get(ref);
-      return ref;
-    }
-
-    const temporary = `${path}.${randomUUID()}.tmp`;
-    await writeFile(temporary, data, { flag: "wx" });
-    try {
-      await link(temporary, path);
-    } catch (error) {
-      if (!(await this.has(ref))) throw error;
-      await this.get(ref);
-    } finally {
-      await unlink(temporary).catch(() => undefined);
-    }
-    return ref;
-  }
-
-  async get(ref: ArtifactRef): Promise<Uint8Array> {
-    assertArtifactRef(ref);
-    const value = new Uint8Array(await readFile(this.pathFor(ref)));
-    const actual = reference(value, {
-      mediaType: ref.mediaType,
-      name: ref.name,
-    });
-    if (actual.sha256 !== ref.sha256 || actual.bytes !== ref.bytes) {
-      throw new ArtifactIntegrityError(ref);
-    }
-    return value;
-  }
-
-  async has(ref: ArtifactRef): Promise<boolean> {
-    assertArtifactRef(ref);
-    try {
-      await stat(this.pathFor(ref));
-      return true;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
-      throw error;
-    }
-  }
-
-  private pathFor(ref: ArtifactRef): string {
-    assertArtifactRef(ref);
-    return join(this.rootDirectory, ref.sha256.slice(0, 2), ref.sha256);
   }
 }

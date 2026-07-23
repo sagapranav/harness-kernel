@@ -1,6 +1,6 @@
 import { assertArtifactRef } from "./artifacts.js";
-import { createId, nowIso } from "./ids.js";
 import { assertJsonSerializable } from "./json.js";
+import { defaultRuntime, type RuntimeServices } from "./runtime.js";
 import type {
   ArtifactRef,
   CanonicalMessage,
@@ -24,6 +24,8 @@ export interface NormalizeProviderOptions {
   rawArtifact?: ArtifactRef;
   /** Defaults to true when `rawArtifact` is absent. */
   preserveRawResponse?: boolean;
+  /** Host identity/time services for generated canonical IDs and timestamps. */
+  runtime?: RuntimeServices;
 }
 
 export class ProviderEncodingError extends Error {
@@ -164,13 +166,14 @@ function stopReason(value: unknown): ModelStopReason {
 function message(
   provider: string,
   content: ContentBlock[],
+  runtime: RuntimeServices,
   id?: string,
 ): CanonicalMessage {
   return {
-    id: id ?? createId("msg"),
+    id: id ?? runtime.createId("msg"),
     role: "assistant",
     content,
-    createdAt: nowIso(),
+    createdAt: runtime.nowIso(),
     provider,
   };
 }
@@ -229,6 +232,7 @@ export function fromOpenAIResponse(
   options: NormalizeProviderOptions,
 ): NormalizedModelResponse {
   assertNormalizationInput(raw, options);
+  const runtime = options.runtime ?? defaultRuntime;
   const root = record(raw);
   const content: ContentBlock[] = [];
   const preserve = options.preserveUnknownBlocks ?? true;
@@ -275,7 +279,10 @@ export function fromOpenAIResponse(
           withProviderMetadata(
             {
               type: "tool_call",
-              id: string(item.call_id) ?? string(item.id) ?? createId("call"),
+              id:
+                string(item.call_id) ??
+                string(item.id) ??
+                runtime.createId("call"),
               name: string(item.name) ?? "unknown_tool",
               input: parsed.input,
               ...(parsed.error === undefined
@@ -324,7 +331,12 @@ export function fromOpenAIResponse(
         ? stopReason(incompleteReason)
         : stopReason(root.status);
   const response: NormalizedModelResponse = {
-    message: message("openai", content, canonicalMessageId ?? string(root.id)),
+    message: message(
+      "openai",
+      content,
+      runtime,
+      canonicalMessageId ?? string(root.id),
+    ),
     telemetry: {
       provider: "openai",
       model: options.model,
@@ -354,6 +366,7 @@ export function fromOpenAIChatCompletion(
   options: NormalizeProviderOptions,
 ): NormalizedModelResponse {
   assertNormalizationInput(raw, options);
+  const runtime = options.runtime ?? defaultRuntime;
   const root = record(raw);
   const choice = record(list(root.choices)[0]);
   const source = record(choice.message);
@@ -393,7 +406,7 @@ export function fromOpenAIChatCompletion(
       withProviderMetadata(
         {
           type: "tool_call",
-          id: string(call.id) ?? createId("call"),
+          id: string(call.id) ?? runtime.createId("call"),
           name: string(fn.name) ?? "unknown_tool",
           input: parsed.input,
           ...(parsed.error === undefined
@@ -420,6 +433,7 @@ export function fromOpenAIChatCompletion(
     message: message(
       "openai-chat",
       content,
+      runtime,
       string(source.id) ?? string(root.id),
     ),
     telemetry: {
@@ -451,6 +465,7 @@ export function fromAnthropicMessage(
   options: NormalizeProviderOptions,
 ): NormalizedModelResponse {
   assertNormalizationInput(raw, options);
+  const runtime = options.runtime ?? defaultRuntime;
   const root = record(raw);
   const content: ContentBlock[] = [];
   const preserve = options.preserveUnknownBlocks ?? true;
@@ -472,7 +487,7 @@ export function fromAnthropicMessage(
           withProviderMetadata(
             {
               type: "tool_call",
-              id: string(block.id) ?? createId("call"),
+              id: string(block.id) ?? runtime.createId("call"),
               name: string(block.name) ?? "unknown_tool",
               input: block.input ?? {},
             },
@@ -527,7 +542,7 @@ export function fromAnthropicMessage(
     ...(reasoningTokens === 0 ? {} : { reasoningTokens }),
   };
   const response: NormalizedModelResponse = {
-    message: message("anthropic", content, string(root.id)),
+    message: message("anthropic", content, runtime, string(root.id)),
     telemetry: {
       provider: "anthropic",
       model: options.model,

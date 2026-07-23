@@ -1,9 +1,5 @@
-import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
-import { createId } from "./ids.js";
 import { validateChain } from "./journal.js";
 import { assertJsonSerializable, cloneJson } from "./json.js";
-import { storageKey } from "./storage.js";
 import type {
   AppendEventInput,
   ArtifactRef,
@@ -288,6 +284,7 @@ export function foldProjection<TState>(
 }
 
 export interface ProjectionStore {
+  /** Load a disposable view; null means the caller should rebuild it. */
   load<TState>(
     sessionId: string,
     name: string,
@@ -296,79 +293,64 @@ export interface ProjectionStore {
   save<TState>(snapshot: ProjectionSnapshot<TState>): Promise<void>;
 }
 
-/** Replaceable cold/materialized views. Raw journals remain authoritative. */
-export class FileProjectionStore implements ProjectionStore {
-  constructor(readonly rootDirectory: string) {}
+export function assertProjectionSnapshot<TState>(
+  snapshot: ProjectionSnapshot<TState>,
+  expected?: { sessionId: string; name: string; version: number },
+): void {
+  assertJsonSerializable(snapshot);
+  if (
+    typeof snapshot.sessionId !== "string" ||
+    snapshot.sessionId.length === 0 ||
+    typeof snapshot.name !== "string" ||
+    snapshot.name.length === 0 ||
+    !Number.isSafeInteger(snapshot.version) ||
+    snapshot.version < 1 ||
+    !Number.isSafeInteger(snapshot.throughSequence) ||
+    snapshot.throughSequence < 0 ||
+    (snapshot.throughSequence === 0
+      ? snapshot.throughEventId !== null
+      : typeof snapshot.throughEventId !== "string" ||
+        snapshot.throughEventId.length === 0)
+  ) {
+    throw new TypeError("projection snapshot envelope is invalid");
+  }
+  if (
+    expected !== undefined &&
+    (snapshot.sessionId !== expected.sessionId ||
+      snapshot.name !== expected.name ||
+      snapshot.version !== expected.version)
+  ) {
+    throw new Error("projection snapshot identity mismatch");
+  }
+}
+
+/** Ephemeral replaceable views for tests and runtime-local caches. */
+export class MemoryProjectionStore implements ProjectionStore {
+  private readonly snapshots = new Map<string, ProjectionSnapshot<unknown>>();
 
   async load<TState>(
     sessionId: string,
     name: string,
     version: number,
   ): Promise<ProjectionSnapshot<TState> | null> {
-    try {
-      const snapshot = JSON.parse(
-        await readFile(this.path(sessionId, name, version), "utf8"),
-      ) as ProjectionSnapshot<TState>;
-      if (
-        snapshot.sessionId !== sessionId ||
-        snapshot.name !== name ||
-        snapshot.version !== version ||
-        !Number.isSafeInteger(snapshot.throughSequence) ||
-        snapshot.throughSequence < 0 ||
-        (snapshot.throughSequence === 0
-          ? snapshot.throughEventId !== null
-          : typeof snapshot.throughEventId !== "string" ||
-            snapshot.throughEventId.length === 0)
-      ) {
-        throw new Error(
-          `projection snapshot identity mismatch: ${this.path(sessionId, name, version)}`,
-        );
-      }
-      return snapshot;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
-      throw error;
-    }
+    const snapshot = this.snapshots.get(this.key(sessionId, name, version));
+    if (snapshot === undefined) return null;
+    assertProjectionSnapshot(snapshot, { sessionId, name, version });
+    return cloneJson(snapshot) as ProjectionSnapshot<TState>;
   }
 
   async save<TState>(snapshot: ProjectionSnapshot<TState>): Promise<void> {
-    assertJsonSerializable(snapshot);
-    if (
-      !Number.isSafeInteger(snapshot.throughSequence) ||
-      snapshot.throughSequence < 0 ||
-      (snapshot.throughSequence === 0
-        ? snapshot.throughEventId !== null
-        : typeof snapshot.throughEventId !== "string" ||
-          snapshot.throughEventId.length === 0)
-    ) {
-      throw new TypeError("projection snapshot boundary is invalid");
-    }
-    const stableSnapshot = cloneJson(snapshot);
-    const path = this.path(
-      stableSnapshot.sessionId,
-      stableSnapshot.name,
-      stableSnapshot.version,
+    assertProjectionSnapshot(snapshot);
+    this.snapshots.set(
+      this.key(snapshot.sessionId, snapshot.name, snapshot.version),
+      cloneJson(snapshot) as ProjectionSnapshot<unknown>,
     );
-    await mkdir(dirname(path), { recursive: true });
-    const temporary = `${path}.${createId("projection")}.tmp`;
-    await writeFile(temporary, `${JSON.stringify(stableSnapshot, null, 2)}\n`, {
-      flag: "wx",
-    });
-    try {
-      await rename(temporary, path);
-    } finally {
-      await unlink(temporary).catch(() => undefined);
-    }
   }
 
-  private path(sessionId: string, name: string, version: number): string {
+  private key(sessionId: string, name: string, version: number): string {
     if (!Number.isSafeInteger(version) || version < 1) {
       throw new TypeError("projection version must be a positive safe integer");
     }
-    return join(
-      this.rootDirectory,
-      storageKey(sessionId, "session id"),
-      `${storageKey(name, "projection name")}-v${version}.json`,
-    );
+    return JSON.stringify([sessionId, name, version]);
   }
 }

@@ -21,6 +21,11 @@ opaque enough to preserve unknown types.
 Store artifacts by SHA-256 in object storage. Store cold projections in normal
 tables or search indexes with `(projection_name, version, through_sequence)`.
 
+Assemble the four implementations into `HarnessStorage`, declare their
+durability and coordination in `StorageProfile`, then run
+`checkHarnessStorage()` against a disposable adapter namespace. See
+[STORAGE.md](STORAGE.md) for the complete contract.
+
 ## Add retrieval
 
 Do not mutate the raw journal. Supply a custom `project` function to

@@ -25,6 +25,10 @@
       "types": "./dist/src/artifacts.d.ts",
       "import": "./dist/src/artifacts.js"
     },
+    "./conformance": {
+      "types": "./dist/src/conformance.d.ts",
+      "import": "./dist/src/conformance.js"
+    },
     "./json": {
       "types": "./dist/src/json.d.ts",
       "import": "./dist/src/json.js"
@@ -37,6 +41,10 @@
       "types": "./dist/src/providers.d.ts",
       "import": "./dist/src/providers.js"
     },
+    "./runtime": {
+      "types": "./dist/src/runtime.d.ts",
+      "import": "./dist/src/runtime.js"
+    },
     "./loop": {
       "types": "./dist/src/loop.d.ts",
       "import": "./dist/src/loop.js"
@@ -45,9 +53,17 @@
       "types": "./dist/src/sessions.d.ts",
       "import": "./dist/src/sessions.js"
     },
+    "./storage": {
+      "types": "./dist/src/storage.d.ts",
+      "import": "./dist/src/storage.js"
+    },
     "./telemetry": {
       "types": "./dist/src/telemetry.d.ts",
       "import": "./dist/src/telemetry.js"
+    },
+    "./node": {
+      "types": "./dist/src/node.d.ts",
+      "import": "./dist/src/node.js"
     }
   },
   "files": [

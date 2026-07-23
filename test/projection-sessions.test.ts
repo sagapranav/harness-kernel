@@ -4,8 +4,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
-  FileProjectionStore,
-  FileSessionCatalog,
   foldProjection,
   MemoryJournalStore,
   MemorySessionCatalog,
@@ -18,6 +16,7 @@ import {
   type CanonicalMessage,
   type ImmutableRunConfig,
 } from "../src/index.js";
+import { FileProjectionStore, FileSessionCatalog } from "../src/node.js";
 
 function textMessage(
   role: CanonicalMessage["role"],

@@ -1,8 +1,8 @@
-import { createId, nowIso } from "./ids.js";
 import { assertArtifactRef } from "./artifacts.js";
 import { assertJsonSerializable } from "./json.js";
 import type { JournalStore } from "./journal.js";
 import { EVENT_TYPES, messageEvent, projectContext } from "./projection.js";
+import { defaultRuntime, type RuntimeServices } from "./runtime.js";
 import type {
   ActionInvocation,
   ActionReceipt,
@@ -44,6 +44,8 @@ export interface AgentLoopOptions {
   actions: ActionExecutor;
   signal?: AbortSignal;
   maxTurns?: number;
+  /** Host identity/time services; inject for deterministic or non-default runtimes. */
+  runtime?: RuntimeServices;
   /**
    * Override context construction for retrieval, inherited child context, or
    * application-specific projections.
@@ -422,7 +424,7 @@ async function executeOne(
   call: ToolCallBlock,
 ): Promise<ActionReceipt> {
   const invocation: ActionInvocation = {
-    invocationId: createId("invocation"),
+    invocationId: (options.runtime ?? defaultRuntime).createId("invocation"),
     sessionId: options.sessionId,
     turnId,
     call,
@@ -486,11 +488,12 @@ async function executeOne(
 function resultMessage(
   invocation: ActionInvocation,
   receipt: ActionReceipt,
+  runtime: RuntimeServices,
 ): CanonicalMessage {
   return {
-    id: createId("msg"),
+    id: runtime.createId("msg"),
     role: "tool",
-    createdAt: nowIso(),
+    createdAt: runtime.nowIso(),
     content: [
       {
         type: "tool_result",
@@ -520,6 +523,7 @@ function resultMessage(
 export async function runAgentLoop(
   options: AgentLoopOptions,
 ): Promise<LoopOutcome> {
+  const runtime = options.runtime ?? defaultRuntime;
   const limit = options.maxTurns ?? 100;
   if (!Number.isSafeInteger(limit) || limit < 0) {
     throw new TypeError("maxTurns must be a non-negative safe integer");
@@ -531,7 +535,7 @@ export async function runAgentLoop(
     await options.journal.append(
       options.sessionId,
       messageEvent(
-        resultMessage(missing.invocation, missing.receipt),
+        resultMessage(missing.invocation, missing.receipt, runtime),
         missing.invocation.turnId,
       ),
     );
@@ -556,7 +560,7 @@ export async function runAgentLoop(
     }
 
     turns += 1;
-    const turnId = createId("turn");
+    const turnId = runtime.createId("turn");
     const context =
       options.project === undefined
         ? projectContext(
@@ -711,7 +715,7 @@ export async function runAgentLoop(
       };
       await options.journal.append(
         options.sessionId,
-        messageEvent(resultMessage(invocation, receipt), turnId),
+        messageEvent(resultMessage(invocation, receipt, runtime), turnId),
       );
     }
 

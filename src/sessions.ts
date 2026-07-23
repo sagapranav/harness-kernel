@@ -1,11 +1,8 @@
-import { link, mkdir, readFile, unlink, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
 import { assertArtifactRef } from "./artifacts.js";
-import { createId, nowIso } from "./ids.js";
 import { assertJsonSerializable, cloneJson, jsonEqual } from "./json.js";
 import { JournalConflictError, type JournalStore } from "./journal.js";
 import { EVENT_TYPES, projectContext } from "./projection.js";
-import { storageKey } from "./storage.js";
+import { defaultRuntime, type RuntimeServices } from "./runtime.js";
 import type {
   ChildResult,
   ContextProjection,
@@ -21,7 +18,7 @@ function timestamp(value: unknown): value is string {
   return typeof value === "string" && !Number.isNaN(Date.parse(value));
 }
 
-function assertSessionDescriptor(session: SessionDescriptor): void {
+export function assertSessionDescriptor(session: SessionDescriptor): void {
   assertJsonSerializable(session);
   if (!nonEmpty(session.id))
     throw new TypeError("session id must not be empty");
@@ -49,7 +46,7 @@ function assertSessionDescriptor(session: SessionDescriptor): void {
     throw new TypeError("session purpose must be a string");
 }
 
-function assertRunConfig(config: ImmutableRunConfig): void {
+export function assertRunConfig(config: ImmutableRunConfig): void {
   assertJsonSerializable(config);
   if (!nonEmpty(config.id)) throw new TypeError("config id must not be empty");
   if (!Number.isSafeInteger(config.version) || config.version < 1)
@@ -101,7 +98,7 @@ function assertRunConfig(config: ImmutableRunConfig): void {
   }
 }
 
-function assertChildResult(result: ChildResult): void {
+export function assertChildResult(result: ChildResult): void {
   assertJsonSerializable(result);
   if (!nonEmpty(result.childSessionId))
     throw new TypeError("child session id must not be empty");
@@ -134,6 +131,7 @@ function assertChildResult(result: ChildResult): void {
 }
 
 export interface SessionCatalog {
+  /** Descriptors and configs are immutable: identical puts are idempotent. */
   putSession(session: SessionDescriptor): Promise<void>;
   getSession(sessionId: string): Promise<SessionDescriptor | null>;
   putConfig(config: ImmutableRunConfig): Promise<void>;
@@ -153,12 +151,12 @@ export class MemorySessionCatalog implements SessionCatalog {
       }
       return;
     }
-    this.sessions.set(session.id, structuredClone(session));
+    this.sessions.set(session.id, cloneJson(session));
   }
 
   async getSession(sessionId: string): Promise<SessionDescriptor | null> {
     const session = this.sessions.get(sessionId);
-    return session === undefined ? null : structuredClone(session);
+    return session === undefined ? null : cloneJson(session);
   }
 
   async putConfig(config: ImmutableRunConfig): Promise<void> {
@@ -167,96 +165,12 @@ export class MemorySessionCatalog implements SessionCatalog {
     if (existing !== undefined && !jsonEqual(existing, config)) {
       throw new Error(`immutable config conflict: ${config.id}`);
     }
-    this.configs.set(config.id, structuredClone(config));
+    this.configs.set(config.id, cloneJson(config));
   }
 
   async getConfig(configId: string): Promise<ImmutableRunConfig | null> {
     const config = this.configs.get(configId);
-    return config === undefined ? null : structuredClone(config);
-  }
-}
-
-/** Immutable JSON descriptors/configs. Journals remain in the JournalStore. */
-export class FileSessionCatalog implements SessionCatalog {
-  constructor(readonly rootDirectory: string) {}
-
-  async putSession(session: SessionDescriptor): Promise<void> {
-    assertSessionDescriptor(session);
-    const stableSession = cloneJson(session);
-    await this.writeOnce(this.sessionPath(stableSession.id), stableSession);
-  }
-
-  async getSession(sessionId: string): Promise<SessionDescriptor | null> {
-    const session = await this.readJson<SessionDescriptor>(
-      this.sessionPath(sessionId),
-    );
-    if (session !== null) assertSessionDescriptor(session);
-    return session;
-  }
-
-  async putConfig(config: ImmutableRunConfig): Promise<void> {
-    assertRunConfig(config);
-    const stableConfig = cloneJson(config);
-    const existing = await this.getConfig(stableConfig.id);
-    if (existing !== null) {
-      if (!jsonEqual(existing, stableConfig)) {
-        throw new Error(`immutable config conflict: ${stableConfig.id}`);
-      }
-      return;
-    }
-    await this.writeOnce(this.configPath(stableConfig.id), stableConfig);
-  }
-
-  async getConfig(configId: string): Promise<ImmutableRunConfig | null> {
-    const config = await this.readJson<ImmutableRunConfig>(
-      this.configPath(configId),
-    );
-    if (config !== null) assertRunConfig(config);
-    return config;
-  }
-
-  private async readJson<T>(path: string): Promise<T | null> {
-    try {
-      return JSON.parse(await readFile(path, "utf8")) as T;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
-      throw error;
-    }
-  }
-
-  private async writeOnce(path: string, value: unknown): Promise<void> {
-    await mkdir(dirname(path), { recursive: true });
-    const temporary = `${path}.${createId("catalog")}.tmp`;
-    await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, {
-      flag: "wx",
-    });
-    try {
-      await link(temporary, path);
-    } catch (error) {
-      const existing = await this.readJson<unknown>(path);
-      if (existing === null) throw error;
-      if (!jsonEqual(existing, value))
-        throw new Error(`immutable value conflict: ${path}`);
-    } finally {
-      await unlink(temporary).catch(() => undefined);
-    }
-  }
-
-  private sessionPath(sessionId: string): string {
-    return join(
-      this.rootDirectory,
-      "sessions",
-      storageKey(sessionId, "session id"),
-      "session.json",
-    );
-  }
-
-  private configPath(configId: string): string {
-    return join(
-      this.rootDirectory,
-      "configs",
-      `${storageKey(configId, "config id")}.json`,
-    );
+    return config === undefined ? null : cloneJson(config);
   }
 }
 
@@ -279,6 +193,7 @@ export class SessionManager {
   constructor(
     readonly journal: JournalStore,
     readonly catalog: SessionCatalog,
+    readonly runtime: RuntimeServices = defaultRuntime,
   ) {}
 
   async create(
@@ -287,9 +202,9 @@ export class SessionManager {
   ): Promise<SessionDescriptor> {
     await this.catalog.putConfig(config);
     const session: SessionDescriptor = {
-      id: options.id ?? createId("session"),
+      id: options.id ?? this.runtime.createId("session"),
       configId: config.id,
-      createdAt: nowIso(),
+      createdAt: this.runtime.nowIso(),
       ...(options.purpose === undefined ? {} : { purpose: options.purpose }),
       ...(options.metadata === undefined ? {} : { metadata: options.metadata }),
     };
@@ -322,9 +237,9 @@ export class SessionManager {
 
     await this.catalog.putConfig(config);
     const child: SessionDescriptor = {
-      id: options.id ?? createId("session"),
+      id: options.id ?? this.runtime.createId("session"),
       configId: config.id,
-      createdAt: nowIso(),
+      createdAt: this.runtime.nowIso(),
       parentSessionId: parent.id,
       forkEventId: forkEvent.id,
       ...(options.purpose === undefined ? {} : { purpose: options.purpose }),
@@ -393,9 +308,9 @@ export class SessionManager {
             data: {
               result,
               message: {
-                id: createId("msg"),
+                id: this.runtime.createId("msg"),
                 role: "user",
-                createdAt: nowIso(),
+                createdAt: this.runtime.nowIso(),
                 content: [
                   {
                     type: "text",
