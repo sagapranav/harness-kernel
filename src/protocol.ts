@@ -146,6 +146,18 @@ export interface ModelTelemetry {
   providerMetadata?: Metadata;
 }
 
+/**
+ * Incremental model output for UI and broadcast projections. Streaming never
+ * replaces the journal: the loop records only the complete normalized
+ * response, so a consumer that missed the stream loses nothing durable.
+ */
+export type ModelStreamEvent =
+  | { type: "text_delta"; text: string }
+  | { type: "reasoning_delta"; text: string }
+  | { type: "tool_call_started"; id: string; name: string }
+  | { type: "tool_call_arguments_delta"; id: string; delta: string }
+  | { type: "stream_completed"; finishReason?: string };
+
 export interface NormalizedModelResponse {
   message: CanonicalMessage;
   telemetry: ModelTelemetry;
