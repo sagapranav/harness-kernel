@@ -182,7 +182,9 @@ export class SessionWorkDispatcher {
       );
     }
     await this.ensureChildStart(session);
-    await this.ensureParentChildStart(parentSessionId, session);
+    if (options.linkInParent !== false) {
+      await this.ensureParentChildStart(parentSessionId, session);
+    }
     return session;
   }
 

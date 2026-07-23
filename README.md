@@ -128,6 +128,14 @@ const outcome = await runAgentLoop({
 });
 ```
 
+The two integration points every harness fills in are both visible above:
+`tools` in the immutable config declare what the model may call, and the
+`ActionExecutor` executes those calls behind journaled receipts. Sub-agents
+use the same mechanism — spawning a child is just another tool whose executor
+calls `SessionWorkDispatcher.forkAndDispatch()`; see
+[`examples/manager-workers.ts`](examples/manager-workers.ts) for the complete
+composition.
+
 Runnable, dependency-free examples (build once, then run the compiled file):
 
 ```bash
@@ -139,10 +147,10 @@ node dist/examples/basic-agent.js
   deterministic model and tool;
 - [`examples/forked-review.ts`](examples/forked-review.ts) — child-session
   forking, inherited context, and `noneFound` results;
-- [`examples/manager-workers.ts`](examples/manager-workers.ts) — cross-provider
-  orchestration: a manager session on one provider (Anthropic in the example)
-  dispatching a capability-routed child worker on another (OpenAI); which model
-  runs a session is configuration, not an orchestration primitive;
+- [`examples/manager-workers.ts`](examples/manager-workers.ts) — agents and
+  tools together: the manager's `spawn_agent` tool forks a capability-routed
+  child worker on a different provider, the child runs its own tool, and its
+  conclusion returns to the manager as one model-visible observation;
 - [`examples/durable-worker.ts`](examples/durable-worker.ts) — the full
   durable composition: queue delivery, fenced session lease, lease renewal,
   deadline checkpoint, and a continuation finishing the run;

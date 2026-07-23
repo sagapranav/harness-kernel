@@ -111,7 +111,7 @@ signatures live in the shipped source and `.d.ts` files.
 
 - `SessionManager` — `create`, `fork`, `completeChild`, `project` (inherited-context projection for children).
 - `SessionCatalog`, `MemorySessionCatalog` — write-once config/descriptor storage.
-- `CreateSessionOptions`, `ForkSessionOptions` — creation options.
+- `CreateSessionOptions`, `ForkSessionOptions` — creation options; `ForkSessionOptions.linkInParent: false` skips the parent `child.started` write when forking inside the parent's own running loop.
 - `assertRunConfig`, `assertSessionDescriptor`, `assertChildResult` — validation helpers.
 
 ## `…/storage` — bundles and profiles

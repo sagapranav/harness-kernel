@@ -139,11 +139,16 @@ The spawn action adapter calls `SessionWorkDispatcher.forkAndDispatch()`:
 const dispatcher = new SessionWorkDispatcher(sessions, queue);
 
 const child = await dispatcher.forkAndDispatch(
-  managerSession.id,
+  invocation.sessionId,
   browserWorkerConfig,
   {
     id: stableChildSessionId,
     purpose: "Collect evidence from the account portal",
+    // The manager loop owns the manager journal for this turn; skip the
+    // parent-side child.started write so it does not collide with the loop's
+    // expected-head compare-and-append. The spawn is already recorded as the
+    // tool's action receipt.
+    linkInParent: false,
   },
   { requiredCapabilities: ["agent", "browser"] },
 );
@@ -155,6 +160,13 @@ the manager. When it finishes, application code calls
 `SessionManager.completeChild()` with the small conclusion and evidence
 references. The parent sees that result as one model-visible observation; it
 does not inherit the child's full search trace.
+
+`linkInParent: false` is required only when forking from **inside** a tool
+executor running on the parent's own loop, because that loop is the sole
+writer of its journal for the turn. Dispatching a child from outside a running
+parent turn (an API handler, a workflow step) keeps the default and records the
+`child.started` trace. [`examples/manager-workers.ts`](../examples/manager-workers.ts)
+shows the full spawn-as-a-tool composition end to end.
 
 For a consequential spawn action, derive `stableChildSessionId` from its
 idempotency key. `forkAndDispatch()` can then recover a descriptor written

@@ -17,7 +17,12 @@ import {
   WorkItemConflictError,
   WorkLeaseConflictError,
   WorkerHost,
+  createId,
+  messageEvent,
+  nowIso,
+  type ActionExecutor,
   type ImmutableRunConfig,
+  type ModelInvoker,
   type RuntimeServices,
   type WorkItem,
 } from "../src/index.js";
@@ -551,4 +556,115 @@ test("agent loop can checkpoint before a serverless host deadline", async () => 
     turns: 0,
     reason: "host deadline approaching",
   });
+});
+
+test("a spawn tool can fork the running session without a loop write conflict", async () => {
+  // Regression: forking from inside a manager tool must not write
+  // child.started to the manager journal, which the loop owns for the turn.
+  const storage = createMemoryStorage();
+  const sessions = new SessionManager(storage.journal, storage.sessions);
+  const queue = new MemoryWorkQueue();
+  const dispatcher = new SessionWorkDispatcher(sessions, queue);
+
+  const managerConfig: ImmutableRunConfig = {
+    id: "manager",
+    version: 1,
+    createdAt: nowIso(),
+    provider: { provider: "anthropic", model: "manager" },
+    tools: [
+      {
+        name: "spawn_agent",
+        description: "Delegate to a child agent.",
+        inputSchema: { type: "object", properties: {} },
+      },
+    ],
+  };
+  const workerConfig: ImmutableRunConfig = {
+    id: "worker",
+    version: 1,
+    createdAt: nowIso(),
+    provider: { provider: "openai", model: "worker" },
+    tools: [],
+  };
+
+  const manager = await sessions.create(managerConfig, { id: "manager-1" });
+  await storage.journal.append(
+    manager.id,
+    messageEvent({
+      id: createId("msg"),
+      role: "user",
+      createdAt: nowIso(),
+      content: [{ type: "text", text: "delegate this" }],
+    }),
+  );
+
+  let turn = 0;
+  const model: ModelInvoker = {
+    async invoke() {
+      turn += 1;
+      return {
+        message: {
+          id: createId("msg"),
+          role: "assistant",
+          createdAt: nowIso(),
+          content:
+            turn === 1
+              ? [
+                  {
+                    type: "tool_call",
+                    id: "spawn-1",
+                    name: "spawn_agent",
+                    input: {},
+                  },
+                ]
+              : [{ type: "text", text: "delegated" }],
+        },
+        telemetry: {
+          provider: "anthropic",
+          model: "manager",
+          latencyMs: 0,
+          stopReason: turn === 1 ? "tool_use" : "end",
+          usage: { inputTokens: 0, outputTokens: 0 },
+        },
+      };
+    },
+  };
+  const actions: ActionExecutor = {
+    async execute(invocation) {
+      const dispatched = await dispatcher.forkAndDispatch(
+        invocation.sessionId,
+        workerConfig,
+        { id: "child-1", linkInParent: false },
+        { requiredCapabilities: ["agent"] },
+      );
+      return {
+        invocationId: invocation.invocationId,
+        status: "succeeded",
+        content: [{ type: "text", text: dispatched.session.id }],
+      };
+    },
+  };
+
+  const outcome = await runAgentLoop({
+    sessionId: manager.id,
+    config: managerConfig,
+    journal: storage.journal,
+    model,
+    actions,
+  });
+  assert.deepEqual(outcome, { status: "completed", turns: 2 });
+
+  // The child exists and is queued; the manager journal never received a
+  // foreign child.started write.
+  assert.ok(await storage.sessions.getSession("child-1"));
+  assert.equal((await queue.get("session:child-1:run"))?.state, "queued");
+  const managerEvents = await storage.journal.read(manager.id);
+  assert.equal(
+    managerEvents.filter((event) => event.type === "child.started").length,
+    0,
+  );
+  assert.equal(
+    managerEvents.filter((event) => event.type === "run.completed").length,
+    1,
+  );
 });

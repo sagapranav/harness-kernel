@@ -182,6 +182,15 @@ export interface CreateSessionOptions {
 
 export interface ForkSessionOptions extends CreateSessionOptions {
   atEventId?: string;
+  /**
+   * Whether to append the `child.started` trace to the parent journal.
+   * Defaults to true. Set false when forking from inside a tool executor that
+   * runs during runAgentLoop() on the parent session: the loop is the sole
+   * writer of its journal for the turn and already records the spawn as an
+   * action receipt, so a synchronous parent write would collide with the
+   * loop's expected-head compare-and-append.
+   */
+  linkInParent?: boolean;
 }
 
 /**
@@ -255,16 +264,18 @@ export class SessionManager {
       },
       { expectedHeadId: null },
     );
-    await this.journal.append(parent.id, {
-      category: "trace",
-      type: EVENT_TYPES.childStarted,
-      data: {
-        childSessionId: child.id,
-        forkEventId: forkEvent.id,
-        configId: config.id,
-        ...(child.purpose === undefined ? {} : { purpose: child.purpose }),
-      },
-    });
+    if (options.linkInParent !== false) {
+      await this.journal.append(parent.id, {
+        category: "trace",
+        type: EVENT_TYPES.childStarted,
+        data: {
+          childSessionId: child.id,
+          forkEventId: forkEvent.id,
+          configId: config.id,
+          ...(child.purpose === undefined ? {} : { purpose: child.purpose }),
+        },
+      });
+    }
     return child;
   }
 
