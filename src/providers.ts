@@ -1055,18 +1055,12 @@ export function toOpenAIInput(
           break;
         case "reasoning": {
           const raw = rawMetadata(block);
-          if (raw?.type !== "reasoning") {
-            messageContent.push({
-              type: textType,
-              text: unencodableText(
-                "openai",
-                block,
-                mode,
-                "reasoning items must retain their original provider metadata",
-              ),
-            });
-            break;
-          }
+          // Reasoning is output-only for the Responses API. A native OpenAI
+          // reasoning item can be echoed within the same conversation; any
+          // other reasoning (e.g. a provider that returns a plain reasoning
+          // string) is not a valid input item, so it is dropped rather than
+          // sent — the journal keeps it for audit.
+          if (raw?.type !== "reasoning") break;
           flushMessage();
           items.push(raw);
           break;
@@ -1385,6 +1379,10 @@ export function toOpenAIChatInput(
                 arguments: JSON.stringify(block.input ?? {}),
               },
             });
+            break;
+          case "reasoning":
+            // Output-only for Chat Completions: never sent back as input.
+            // Retained in the journal, dropped on the wire.
             break;
           default:
             text.push(

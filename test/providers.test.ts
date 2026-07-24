@@ -131,10 +131,14 @@ test("Anthropic normalization and outbound encoders preserve shared semantics", 
     ),
     true,
   );
-  assert.throws(
-    () => toOpenAIInput([normalized.message]),
-    ProviderEncodingError,
+  // OpenAI has no input concept for Anthropic thinking; it is dropped on the
+  // wire (kept in the journal), and the rest of the message still encodes.
+  const asOpenAI = toOpenAIInput([normalized.message]);
+  assert.equal(
+    asOpenAI.some((item) => item.type === "reasoning"),
+    false,
   );
+  assert.ok(asOpenAI.some((item) => item.type === "function_call"));
 });
 
 test("OpenAI Responses encoding preserves item order and fails on unsupported artifacts", () => {
@@ -380,13 +384,16 @@ test("unencodable: describe downgrades blocks to deterministic placeholders", ()
     },
   ];
 
+  // The image inside the tool result is the unencodable content here;
+  // reasoning is dropped on the wire regardless of mode.
   assert.throws(() => toOpenAIInput(messages), ProviderEncodingError);
   const openai = toOpenAIInput(messages, { unencodable: "describe" });
   const assistant = openai[0]?.content as Array<{ type: string; text: string }>;
-  assert.deepEqual(assistant[0], {
-    type: "output_text",
-    text: "[unencodable reasoning block]",
-  });
+  assert.deepEqual(assistant[0], { type: "output_text", text: "done" });
+  assert.equal(
+    openai.some((item) => item.type === "reasoning"),
+    false,
+  );
   const output = openai.find((item) => item.type === "function_call_output");
   assert.equal(
     output?.output,
@@ -587,18 +594,17 @@ test("Chat Completions outbound encoding links tools and results", () => {
     },
   ]);
 
-  assert.throws(
-    () =>
-      toOpenAIChatInput([
-        {
-          id: "msg-reasoning",
-          role: "assistant",
-          createdAt: nowIso(),
-          content: [{ type: "reasoning", text: "hidden" }],
-        },
-      ]),
-    ProviderEncodingError,
-  );
+  // Reasoning is output-only for Chat Completions: dropped on the wire.
+  const reasoningOnly = toOpenAIChatInput([
+    {
+      id: "msg-reasoning",
+      role: "assistant",
+      createdAt: nowIso(),
+      content: [{ type: "reasoning", text: "hidden" }],
+    },
+  ]);
+  assert.equal(reasoningOnly[0]!.content, null);
+  assert.equal(JSON.stringify(reasoningOnly).includes("hidden"), false);
 });
 
 test("chat completion streams accumulate into a normalizable response", async () => {
@@ -836,4 +842,37 @@ test("imageDetail sets OpenAI image fidelity and omits by default", async () => 
     () => toOpenAIChatInput(messages, { imageDetail: "medium" as never }),
     /imageDetail/,
   );
+});
+
+test("reasoning blocks are dropped on the wire, not rejected", async () => {
+  // A reasoning model (e.g. GLM) returns reasoning in assistant messages. It is
+  // output-only for these APIs, so encoders omit it rather than throwing.
+  const message = {
+    id: "a",
+    role: "assistant" as const,
+    createdAt: "2026-01-01T00:00:00.000Z",
+    content: [
+      { type: "reasoning" as const, text: "Let me think about the plan." },
+      { type: "text" as const, text: "Writing the file." },
+      {
+        type: "tool_call" as const,
+        id: "call-1",
+        name: "write_file",
+        input: { path: "a.js" },
+      },
+    ],
+  };
+
+  const chat = toOpenAIChatInput([message]);
+  assert.equal(chat.length, 1);
+  assert.equal(chat[0]!.content, "Writing the file.");
+  assert.equal((chat[0]!.tool_calls as Array<{ id: string }>)[0]!.id, "call-1");
+  assert.equal(JSON.stringify(chat).includes("think about the plan"), false);
+
+  const responses = toOpenAIInput([message]);
+  assert.equal(
+    JSON.stringify(responses).includes("think about the plan"),
+    false,
+  );
+  assert.ok(responses.some((item) => item.type === "function_call"));
 });

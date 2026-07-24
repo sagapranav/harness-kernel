@@ -192,33 +192,52 @@ available from the explicit `/node` subpath.
 ## Transcript viewer
 
 Point the viewer at a session and it renders a self-contained, dependency-free
-HTML page from the raw logs — no server, opens locally:
+HTML page from the raw logs — no server, no network, opens locally. Give it a
+storage bundle and a session id; it reads the journal, the immutable config,
+computed telemetry, and every sub-agent session, and returns a complete HTML
+string that you write to a file:
 
 ```ts
-import { renderSessionViewer } from "@sagapranav/harness-kernel/node";
+import {
+  createFileStorage,
+  renderSessionViewer,
+} from "@sagapranav/harness-kernel/node";
 import { writeFile } from "node:fs/promises";
 
-const html = await renderSessionViewer(storage, sessionId);
+const storage = createFileStorage("./harness-data"); // the same bundle the run used
+const html = await renderSessionViewer(storage, sessionId, {
+  title: "My agent run", // optional
+});
 await writeFile("session-viewer.html", html);
+// open session-viewer.html in a browser
 ```
 
-It reads the journal, the immutable config, computed telemetry, and every
-sub-agent session, and produces three tabs:
+`renderSessionViewer(storage, sessionId, options?)` works with any
+`HarnessStorage` — the durable `createFileStorage` bundle or an in-memory one —
+so you can render a run straight from disk after it finished. Options:
+`inlineImages` (default true), `maxImageBytes` (default 4 MB), `includeChildren`
+(default true), and `title`. `collectSessionBundle(storage, sessionId, options?)`
+returns the same data as a plain object if you want to build your own UI.
+
+The page is dark, has no external dependencies, and shows three tabs:
 
 - **Overview** — pins the model configuration, the system prompt (agent
   instructions), the tools, the initial user prompt, the aggregate telemetry
-  (tokens, cost, tool calls), and the final outcome.
-- **Transcript** — the readable conversation: user/assistant/tool messages,
-  tool calls and results, reasoning, inline images, and a per-turn telemetry
-  chip.
-- **Raw** — the underlying events as clean, per-event JSON.
+  (tokens, cost, tool calls, failures), and the final outcome.
+- **Transcript** — the readable conversation. Assistant/user text renders as
+  **Markdown** (headings, lists, bold, links, inline code, code fences). Each
+  turn, each tool call, and each large code block is independently
+  **collapsible** (with Expand-all / Collapse-all); a tool call shows its name,
+  arguments, and result together — the code it wrote and the output it produced
+  — so a tool trajectory reads as one unit. Reasoning, inline images, and a
+  per-turn telemetry chip are shown too.
+- **Raw** — every event as clean, syntax-highlighted, per-event JSON.
 
 A session switcher and in-transcript links navigate into sub-agent
 (child-session) transcripts and back to the parent. Small image artifacts are
 inlined as data URLs so they render; large ones show a reference placeholder.
-`collectSessionBundle()` returns the same data as a plain object if you want to
-build your own view. The page is a disposable projection — the raw events
-remain authoritative.
+The page is a disposable projection — the raw events remain authoritative. See
+[`examples/render-viewer.ts`](examples/render-viewer.ts).
 
 ## Core invariants
 
