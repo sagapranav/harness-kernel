@@ -400,23 +400,27 @@ test("unencodable: describe downgrades blocks to deterministic placeholders", ()
     `screenshot\n[unencodable image block: ${artifact.uri}]`,
   );
 
-  // Reasoning without native Anthropic metadata degrades the same way.
-  const bare = [
+  // An image with no encodable payload downgrades the same way for Anthropic.
+  const imageMessage = [
     {
       id: "assistant",
       role: "assistant" as const,
       createdAt: "2026-01-01T00:00:00.000Z",
-      content: [{ type: "reasoning" as const, text: "hidden" }],
+      content: [
+        { type: "text" as const, text: "see" },
+        { type: "image" as const, artifact },
+      ],
     },
   ];
-  assert.throws(() => toAnthropicInput(bare), ProviderEncodingError);
-  const anthropic = toAnthropicInput(bare, { unencodable: "describe" });
+  assert.throws(() => toAnthropicInput(imageMessage), ProviderEncodingError);
+  const anthropic = toAnthropicInput(imageMessage, { unencodable: "describe" });
   assert.deepEqual(anthropic.messages[0]?.content, [
-    { type: "text", text: "[unencodable reasoning block]" },
+    { type: "text", text: "see" },
+    { type: "text", text: `[unencodable image block: ${artifact.uri}]` },
   ]);
 
   assert.throws(
-    () => toAnthropicInput(bare, { unencodable: "discard" as never }),
+    () => toAnthropicInput(imageMessage, { unencodable: "discard" as never }),
     TypeError,
   );
 });
@@ -875,4 +879,170 @@ test("reasoning blocks are dropped on the wire, not rejected", async () => {
     false,
   );
   assert.ok(responses.some((item) => item.type === "function_call"));
+});
+
+test("opaque reasoning round-trips: capture and echo signatures/encrypted data", () => {
+  // Anthropic-format reasoning (via an OpenRouter-style response): a signature
+  // that must be returned verbatim.
+  const signed = fromOpenAIChatCompletion(
+    {
+      id: "gen-1",
+      model: "anthropic/claude-sonnet-4.5",
+      choices: [
+        {
+          finish_reason: "tool_calls",
+          message: {
+            role: "assistant",
+            content: "The answer is 41.",
+            reasoning: "c = sqrt(81+1600) = 41",
+            tool_calls: [
+              {
+                id: "call-1",
+                type: "function",
+                function: { name: "record", arguments: '{"h":41}' },
+              },
+            ],
+            reasoning_details: [
+              {
+                type: "reasoning.text",
+                text: "c = sqrt(81+1600) = 41",
+                format: "anthropic-claude-v1",
+                index: 0,
+                signature: "SIG_ABC",
+              },
+            ],
+          },
+        },
+      ],
+      usage: { prompt_tokens: 5, completion_tokens: 3 },
+    },
+    { model: "anthropic/claude-sonnet-4.5" },
+  );
+  const block = signed.message.content.find((b) => b.type === "reasoning");
+  assert.ok(block && block.type === "reasoning");
+  assert.equal(block.text, "c = sqrt(81+1600) = 41");
+  assert.equal(block.details?.[0]?.signature, "SIG_ABC");
+
+  // Chat Completions echo keeps the signature so tool use stays coherent.
+  const chat = toOpenAIChatInput([signed.message]);
+  const assistant = chat.find((m) => m.role === "assistant")!;
+  const echoed = assistant.reasoning_details as Array<{ signature?: string }>;
+  assert.equal(echoed[0]!.signature, "SIG_ABC");
+
+  // And it reconstructs a native Anthropic thinking block with the signature.
+  const anthropic = toAnthropicInput([signed.message]);
+  const thinking = (
+    anthropic.messages[0]!.content as Array<Record<string, unknown>>
+  ).find((b) => b.type === "thinking");
+  assert.equal(thinking?.signature, "SIG_ABC");
+  assert.equal(thinking?.thinking, "c = sqrt(81+1600) = 41");
+
+  // OpenAI-format encrypted reasoning: no visible text, opaque data preserved.
+  const encrypted = fromOpenAIChatCompletion(
+    {
+      id: "gen-2",
+      model: "openai/o4-mini",
+      choices: [
+        {
+          finish_reason: "stop",
+          message: {
+            role: "assistant",
+            content: "done",
+            reasoning_details: [
+              {
+                type: "reasoning.encrypted",
+                data: "ENC_XYZ",
+                format: "openai-responses-v1",
+                id: "rs_1",
+                index: 0,
+              },
+            ],
+          },
+        },
+      ],
+      usage: { prompt_tokens: 1, completion_tokens: 1 },
+    },
+    { model: "openai/o4-mini" },
+  );
+  const enc = encrypted.message.content.find((b) => b.type === "reasoning");
+  assert.ok(enc && enc.type === "reasoning");
+  assert.equal(enc.redacted, true);
+  assert.equal(enc.details?.[0]?.data, "ENC_XYZ");
+  const responses = toOpenAIInput([encrypted.message]);
+  const item = responses.find((i) => i.type === "reasoning") as {
+    encrypted_content?: string;
+    id?: string;
+  };
+  assert.equal(item.encrypted_content, "ENC_XYZ");
+  assert.equal(item.id, "rs_1");
+});
+
+test("streaming accumulates reasoning_details with a trailing signature", () => {
+  const accumulator = createChatCompletionStreamAccumulator();
+  for (const chunk of [
+    {
+      id: "g",
+      model: "anthropic/claude-sonnet-4.5",
+      choices: [
+        {
+          index: 0,
+          delta: {
+            role: "assistant",
+            reasoning_details: [
+              {
+                type: "reasoning.text",
+                text: "Let me ",
+                format: "anthropic-claude-v1",
+                index: 0,
+              },
+            ],
+          },
+        },
+      ],
+    },
+    {
+      id: "g",
+      choices: [
+        {
+          index: 0,
+          delta: {
+            reasoning_details: [
+              { type: "reasoning.text", text: "think.", index: 0 },
+            ],
+          },
+        },
+      ],
+    },
+    {
+      id: "g",
+      choices: [
+        {
+          index: 0,
+          delta: {
+            reasoning_details: [{ index: 0, signature: "SIG_FINAL" }],
+          },
+        },
+      ],
+    },
+    { id: "g", choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+  ]) {
+    accumulator.push(chunk);
+  }
+  const response = accumulator.response() as {
+    choices: Array<{
+      message: { reasoning_details: Array<Record<string, unknown>> };
+    }>;
+  };
+  const details = response.choices[0]!.message.reasoning_details;
+  assert.equal(details.length, 1);
+  assert.equal(details[0]!.text, "Let me think.");
+  assert.equal(details[0]!.signature, "SIG_FINAL");
+  assert.equal(details[0]!.format, "anthropic-claude-v1");
+
+  const normalized = fromOpenAIChatCompletion(response, { model: "m" });
+  const block = normalized.message.content.find((b) => b.type === "reasoning");
+  assert.equal(
+    block?.type === "reasoning" ? block.details?.[0]?.signature : null,
+    "SIG_FINAL",
+  );
 });

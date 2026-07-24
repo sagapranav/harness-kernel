@@ -120,6 +120,43 @@ stream via the SDK's own accumulation and normalize the final message with
 `fromAnthropicMessage()`, forwarding `request.onStream` events from the SDK's
 delta callbacks.
 
+## Reasoning
+
+Reasoning is first-class, because providers treat it in two different ways:
+
+- **Plaintext reasoning** (visible chain-of-thought): DeepSeek `reasoning_content`,
+  and the plaintext `reasoning` string. It is output-only — the APIs do not
+  accept it back as input — so encoders drop it on the wire (the journal keeps
+  it).
+- **Opaque, must-return reasoning**: the provider hands back a blob it requires
+  returned verbatim on the next turn, or tool use across turns breaks. Examples:
+  an Anthropic thinking **signature**, an OpenAI Responses reasoning item's
+  **`encrypted_content`**, and the `reasoning_details` array that OpenRouter-style
+  APIs return for both.
+
+Normalization captures `reasoning_details` verbatim into
+`ReasoningBlock.details` (a first-class field, so it survives even when
+`providerMetadata` is stripped). Each detail keeps its `type`, `format`
+(`anthropic-claude-v1`, `openai-responses-v1`, …), `text`, `signature`, `data`,
+`id`, and `index`. A detail with no visible text is marked `redacted`. The
+streaming accumulator merges `reasoning_details` deltas by index and captures
+the trailing signature.
+
+Encoding always echoes the opaque reasoning; it never drops or placeholders it:
+
+- `toOpenAIChatInput` re-emits `reasoning_details` on the assistant message, so
+  a reasoning model keeps tool-call continuity across turns.
+- `toAnthropicInput` echoes a native thinking block if present, otherwise
+  reconstructs `thinking` (signature + text) or `redacted_thinking` (encrypted
+  data) from the details.
+- `toOpenAIInput` echoes a native reasoning item if present, otherwise
+  reconstructs one with `encrypted_content` from OpenAI-format details.
+
+Only plaintext-only reasoning (no details, no signature) is dropped, and
+`unencodable: "describe"` never applies to reasoning — an opaque reasoning blob
+is echoed or, if it genuinely cannot be encoded to the target, omitted, but it
+is never turned into a text placeholder (which would corrupt the API contract).
+
 ## Fail-loud boundary
 
 Artifacts contain bytes, while provider image/file inputs require a URL,

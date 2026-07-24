@@ -11,6 +11,7 @@ import type {
   ModelStreamEvent,
   NormalizedModelResponse,
   ProviderBlock,
+  ReasoningDetail,
   TokenUsage,
   ToolDefinition,
 } from "./protocol.js";
@@ -459,16 +460,29 @@ export function fromOpenAIChatCompletion(
       ),
     );
   }
-  // OpenRouter and several compatible endpoints use `reasoning`; DeepSeek-style
-  // endpoints use `reasoning_content`.
-  const reasoning =
-    string(source.reasoning_content) ?? string(source.reasoning);
-  if (reasoning !== undefined && reasoning.length > 0) {
+  // OpenRouter-style endpoints return opaque, must-echo reasoning fragments in
+  // `reasoning_details` (with Anthropic signatures / OpenAI encrypted data) and
+  // a plaintext `reasoning` string; DeepSeek-style endpoints use
+  // `reasoning_content`. Preserve the details verbatim.
+  const reasoningDetails = list(source.reasoning_details)
+    .map((detail) => record(detail))
+    .filter((detail) => Object.keys(detail).length > 0);
+  const reasoningText =
+    string(source.reasoning_content) ??
+    string(source.reasoning) ??
+    (reasoningDetails.length > 0
+      ? reasoningDetails.map((detail) => string(detail.text) ?? "").join("")
+      : undefined);
+  const visibleReasoning =
+    reasoningText !== undefined && reasoningText.length > 0;
+  if (reasoningDetails.length > 0) {
     content.push({
       type: "reasoning",
-      text: reasoning,
-      providerMetadata: { raw: reasoning },
+      ...(visibleReasoning ? { text: reasoningText } : { redacted: true }),
+      details: reasoningDetails as ReasoningDetail[],
     });
+  } else if (visibleReasoning) {
+    content.push({ type: "reasoning", text: reasoningText });
   }
 
   const usage = record(root.usage);
@@ -609,6 +623,57 @@ export function fromAnthropicMessage(
   return snapshot === undefined
     ? response
     : { ...response, providerSnapshot: snapshot };
+}
+
+function reasoningDetailsOf(block: ContentBlock): ReasoningDetail[] {
+  return block.type === "reasoning" && Array.isArray(block.details)
+    ? block.details
+    : [];
+}
+
+/** Reconstruct Anthropic thinking blocks from preserved reasoning details. */
+function anthropicThinkingFromDetails(
+  details: ReasoningDetail[],
+): UnknownRecord[] {
+  const out: UnknownRecord[] = [];
+  for (const detail of details) {
+    if (
+      typeof detail.signature === "string" &&
+      typeof detail.text === "string"
+    ) {
+      out.push({
+        type: "thinking",
+        thinking: detail.text,
+        signature: detail.signature,
+      });
+    } else if (typeof detail.data === "string") {
+      out.push({ type: "redacted_thinking", data: detail.data });
+    }
+  }
+  return out;
+}
+
+/** Reconstruct OpenAI Responses reasoning items from preserved details. */
+function openAIReasoningFromDetails(
+  details: ReasoningDetail[],
+): UnknownRecord[] {
+  const out: UnknownRecord[] = [];
+  for (const detail of details) {
+    if (
+      typeof detail.format === "string" &&
+      detail.format.startsWith("openai")
+    ) {
+      out.push({
+        type: "reasoning",
+        summary: [],
+        ...(typeof detail.id === "string" ? { id: detail.id } : {}),
+        ...(typeof detail.data === "string"
+          ? { encrypted_content: detail.data }
+          : {}),
+      });
+    }
+  }
+  return out;
 }
 
 function rawMetadata(block: {
@@ -916,6 +981,8 @@ function assertCanonicalForEncoding(
           ) {
             fail("signature must be a string");
           }
+          if (block.details !== undefined && !Array.isArray(block.details))
+            fail("details must be an array");
           break;
         case "provider":
           if (typeof block.provider !== "string" || block.provider.length === 0)
@@ -1054,15 +1121,22 @@ export function toOpenAIInput(
           });
           break;
         case "reasoning": {
+          // Echo the opaque, must-return reasoning: a native reasoning item if
+          // present, otherwise reconstruct one from the preserved OpenAI-format
+          // details (with encrypted_content). Plaintext-only or foreign-format
+          // reasoning is not a valid Responses input item and is dropped; the
+          // journal keeps it for audit.
           const raw = rawMetadata(block);
-          // Reasoning is output-only for the Responses API. A native OpenAI
-          // reasoning item can be echoed within the same conversation; any
-          // other reasoning (e.g. a provider that returns a plain reasoning
-          // string) is not a valid input item, so it is dropped rather than
-          // sent — the journal keeps it for audit.
-          if (raw?.type !== "reasoning") break;
-          flushMessage();
-          items.push(raw);
+          if (raw?.type === "reasoning") {
+            flushMessage();
+            items.push(raw);
+            break;
+          }
+          const rebuilt = openAIReasoningFromDetails(reasoningDetailsOf(block));
+          if (rebuilt.length > 0) {
+            flushMessage();
+            for (const item of rebuilt) items.push(item);
+          }
           break;
         }
         case "provider": {
@@ -1231,23 +1305,24 @@ export function toAnthropicInput(
               "thinking requires assistant role",
             );
           }
+          // Echo the signed thinking verbatim: a native thinking block if
+          // present, otherwise reconstruct it from the preserved details
+          // (signature + text, or redacted encrypted data). Never replace a
+          // signed thinking block with a placeholder — that violates the API
+          // contract. Plaintext-only or foreign-format reasoning is dropped.
           const raw = rawMetadata(block);
           if (
-            raw === null ||
-            (raw.type !== "thinking" && raw.type !== "redacted_thinking")
+            raw !== null &&
+            (raw.type === "thinking" || raw.type === "redacted_thinking")
           ) {
-            content.push({
-              type: "text",
-              text: unencodableText(
-                "anthropic",
-                block,
-                mode,
-                "thinking blocks must retain their original provider metadata",
-              ),
-            });
+            content.push(raw);
             break;
           }
-          content.push(raw);
+          for (const item of anthropicThinkingFromDetails(
+            reasoningDetailsOf(block),
+          )) {
+            content.push(item);
+          }
           break;
         }
         case "provider":
@@ -1365,6 +1440,7 @@ export function toOpenAIChatInput(
     if (source.role === "assistant") {
       const text: string[] = [];
       const toolCalls: UnknownRecord[] = [];
+      const reasoningDetails: ReasoningDetail[] = [];
       for (const block of source.content) {
         switch (block.type) {
           case "text":
@@ -1381,8 +1457,11 @@ export function toOpenAIChatInput(
             });
             break;
           case "reasoning":
-            // Output-only for Chat Completions: never sent back as input.
-            // Retained in the journal, dropped on the wire.
+            // Echo opaque reasoning verbatim as reasoning_details (with
+            // signatures/encrypted data) so reasoning models keep tool-call
+            // continuity across turns; plaintext-only reasoning (no details)
+            // is output-only and dropped.
+            reasoningDetails.push(...reasoningDetailsOf(block));
             break;
           default:
             text.push(
@@ -1399,6 +1478,9 @@ export function toOpenAIChatInput(
         role: "assistant",
         content: text.length === 0 ? null : text.join("\n"),
         ...(toolCalls.length === 0 ? {} : { tool_calls: toolCalls }),
+        ...(reasoningDetails.length === 0
+          ? {}
+          : { reasoning_details: reasoningDetails }),
       });
       continue;
     }
@@ -1543,6 +1625,7 @@ interface StreamChoiceState {
   finishReason: string | null;
   content: string | null;
   reasoning: string | null;
+  reasoningDetails: Map<number, UnknownRecord>;
   toolCalls: Map<number, StreamToolCallState>;
   completed: boolean;
 }
@@ -1565,6 +1648,7 @@ export function createChatCompletionStreamAccumulator(): ChatCompletionStreamAcc
       finishReason: null,
       content: null,
       reasoning: null,
+      reasoningDetails: new Map(),
       toolCalls: new Map(),
       completed: false,
     };
@@ -1615,6 +1699,31 @@ export function createChatCompletionStreamAccumulator(): ChatCompletionStreamAcc
           if (primary && reasoningDelta.length > 0) {
             events.push({ type: "reasoning_delta", text: reasoningDelta });
           }
+        }
+        // Accumulate opaque reasoning_details verbatim, merging by index:
+        // text concatenates, signatures/data/format/id are captured as they
+        // arrive (typically in the final fragment).
+        let detailText = "";
+        for (const detailValue of list(delta.reasoning_details)) {
+          const detail = record(detailValue);
+          const detailIndex = Number.isSafeInteger(detail.index)
+            ? (detail.index as number)
+            : 0;
+          const accumulated = state.reasoningDetails.get(detailIndex) ?? {};
+          for (const field of ["type", "format", "signature", "data", "id"]) {
+            if (detail[field] !== undefined) accumulated[field] = detail[field];
+          }
+          if (typeof detail.text === "string") {
+            accumulated.text =
+              (typeof accumulated.text === "string" ? accumulated.text : "") +
+              detail.text;
+            detailText += detail.text;
+          }
+          accumulated.index = detailIndex;
+          state.reasoningDetails.set(detailIndex, accumulated);
+        }
+        if (reasoningDelta === undefined && primary && detailText.length > 0) {
+          events.push({ type: "reasoning_delta", text: detailText });
         }
         for (const callValue of list(delta.tool_calls)) {
           const call = record(callValue);
@@ -1682,6 +1791,13 @@ export function createChatCompletionStreamAccumulator(): ChatCompletionStreamAcc
             ...(state.reasoning === null || state.reasoning.length === 0
               ? {}
               : { reasoning: state.reasoning }),
+            ...(state.reasoningDetails.size === 0
+              ? {}
+              : {
+                  reasoning_details: [...state.reasoningDetails.entries()]
+                    .sort((left, right) => left[0] - right[0])
+                    .map(([, detail]) => detail),
+                }),
             ...(state.toolCalls.size === 0
               ? {}
               : {

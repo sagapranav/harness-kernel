@@ -53,11 +53,46 @@ export interface ToolResultBlock {
   providerMetadata?: Metadata;
 }
 
+/**
+ * One provider-native reasoning fragment, preserved verbatim. Providers that
+ * expose reasoning through an OpenAI-compatible API (OpenRouter and others)
+ * return these as `reasoning_details`, and several require them returned
+ * unchanged on the next turn — an Anthropic thinking `signature` or an OpenAI
+ * `data`/encrypted payload — or tool use across turns breaks. Treat this as
+ * opaque: keep every field, do not synthesize or edit it.
+ */
+export interface ReasoningDetail {
+  /** e.g. `reasoning.text`, `reasoning.encrypted`, `reasoning.summary`. */
+  type: string;
+  /** Provider format tag, e.g. `anthropic-claude-v1`, `openai-responses-v1`. */
+  format?: string;
+  /** Human-visible reasoning text, when the provider exposes it. */
+  text?: string;
+  /** Opaque signature that must be returned verbatim (Anthropic-style). */
+  signature?: string;
+  /** Opaque encrypted payload that must be returned verbatim (OpenAI-style). */
+  data?: string;
+  /** Provider item identifier, when present. */
+  id?: string;
+  /** Ordering index within the turn. */
+  index?: number;
+  [key: string]: unknown;
+}
+
 export interface ReasoningBlock {
   type: "reasoning";
+  /** Human-visible reasoning text, for display and plaintext round-trip. */
   text?: string;
   redacted?: boolean;
+  /** Opaque signature (Anthropic direct API). Also carried in `details`. */
   signature?: string;
+  /**
+   * Provider-native reasoning fragments preserved verbatim for lossless
+   * round-trip, including the opaque signatures/encrypted content a provider
+   * requires returned. First-class so it survives even when
+   * `providerMetadata` is stripped.
+   */
+  details?: ReasoningDetail[];
   providerMetadata?: Metadata;
 }
 

@@ -8,6 +8,7 @@ signatures live in the shipped source and `.d.ts` files.
 
 - `CanonicalMessage`, `MessageRole`, `Metadata` — provider-neutral message envelope.
 - `ContentBlock` = `TextBlock` | `ImageBlock` | `FileBlock` | `ToolCallBlock` | `ToolResultBlock` | `ReasoningBlock` | `ProviderBlock` — message content.
+- `ReasoningBlock` / `ReasoningDetail` — model reasoning; `details` preserves provider-native `reasoning_details` (signatures/encrypted content) verbatim for lossless, must-return round-trip.
 - `ArtifactRef` — SHA-256 content address (`sha256`, `uri`, `bytes`, `mediaType`).
 - `ToolDefinition`, `ProviderRef`, `ImmutableRunConfig` — versioned run configuration.
 - `NormalizedModelResponse`, `ModelTelemetry`, `TokenUsage`, `ModelStopReason` — normalized model output.

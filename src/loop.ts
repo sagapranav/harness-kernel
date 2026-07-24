@@ -199,6 +199,8 @@ function contentProtocolError(
           typeof block.signature !== "string"
         )
           return `${path}[${index}].signature must be a string`;
+        if (block.details !== undefined && !Array.isArray(block.details))
+          return `${path}[${index}].details must be an array`;
         break;
       case "provider":
         if (typeof block.provider !== "string" || block.provider.length === 0)
