@@ -5,6 +5,8 @@ import {
   createId,
   createMemoryStorage,
   messageEvent,
+  MemoryMailboxStore,
+  receiveMailbox,
   nowIso,
   type ImmutableRunConfig,
 } from "../src/index.js";
@@ -122,6 +124,46 @@ test("viewer bundle captures a parent, its sub-agent, config, and image", async 
   assert.equal(
     /<script type="application\/json"[^>]*>[\s\S]*?<\/script>/.test(html),
     true,
+  );
+});
+
+test("viewer includes delivered mailbox observations and their images", async () => {
+  const storage = createMemoryStorage();
+  const sessions = new SessionManager(storage.journal, storage.sessions);
+  const session = await sessions.create({
+    id: "mail-config",
+    version: 1,
+    createdAt: nowIso(),
+    provider: { provider: "test", model: "test" },
+    tools: [],
+  });
+  const mailbox = new MemoryMailboxStore();
+  const artifact = await storage.artifacts.put(
+    new Uint8Array([137, 80, 78, 71]),
+    {
+      mediaType: "image/png",
+    },
+  );
+  await mailbox.send({
+    id: "image-note",
+    senderSessionId: "researcher",
+    recipientSessionId: session.id,
+    createdAt: nowIso(),
+    body: { type: "message", content: [{ type: "image", artifact }] },
+  });
+  await receiveMailbox({
+    sessionId: session.id,
+    mailbox,
+    journal: storage.journal,
+  });
+  const bundle = await collectSessionBundle(storage, session.id);
+  assert.ok(
+    bundle.images[artifact.sha256]?.startsWith("data:image/png;base64,"),
+  );
+  assert.ok(
+    bundle.sessions[session.id]!.events.some(
+      (event) => event.type === "mailbox.message.received",
+    ),
   );
 });
 

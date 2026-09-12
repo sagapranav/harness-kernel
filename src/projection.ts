@@ -21,6 +21,7 @@ export const EVENT_TYPES = {
   actionCompleted: "action.completed",
   childStarted: "child.started",
   childCompleted: "child.completed",
+  mailboxMessageReceived: "mailbox.message.received",
   runCompleted: "run.completed",
 } as const;
 

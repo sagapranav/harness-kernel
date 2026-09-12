@@ -192,6 +192,23 @@ Use one of these patterns:
 Never generate a fresh work ID on every retry. That converts a recovery retry
 into duplicate agent execution.
 
+## Parent/child messages while agents run
+
+Use `MailboxStore` for notes, progress, questions, and child conclusions that may
+arrive while the recipient is active. Pass `mailbox` to the recipient loop; its
+tracked writer delivers bounded batches between turns. A sender must not call
+`completeChild()` directly against an actively running parent.
+
+`waitForMailbox()` is a bounded local wait for pending mail. `pendingRecipients()`
+lets a scheduler recover missed notifications after restart. The host still owns
+wait-for-any/all policies, permission checks, wake coalescing, and an active work
+record that survives the interval between delivery and model consumption.
+
+Do not create competing recipient loops per message or repeatedly checkpoint
+empty waits. A completed work item cannot be reopened by re-enqueuing the same
+ID; follow-up runs require a distinct stable work identity or an active
+continuation. Read [MAILBOX.md](MAILBOX.md) before integrating the handoff.
+
 ## Workers on one or many machines
 
 `WorkerHost` handles one bounded delivery. A service, CLI, Lambda handler, or

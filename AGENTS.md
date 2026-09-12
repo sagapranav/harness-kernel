@@ -14,7 +14,8 @@ Read:
 6. `docs/STORAGE.md` when changing runtime or persistence behavior
 7. `docs/ORCHESTRATION.md` when changing queues, workers, leases, or deployment
 8. `docs/ADOPTION.md` when integrating the kernel into an existing system
-9. the module you intend to change
+9. `docs/MAILBOX.md` when changing session communication, delivery, or wake-up handoff
+10. the module you intend to change
 
 Run `npm run check` before and after any behavioral change.
 
@@ -41,6 +42,10 @@ Run `npm run check` before and after any behavioral change.
 - Never re-execute an action whose `action.started` event exists; reconcile it
   from the external postcondition instead.
 - Never place a compaction boundary between a tool call and its result.
+- Never write directly to another actively running session to deliver a note or child result; send through its mailbox.
+- Never acknowledge mail before its recipient journal event commits, or discard the raw delivery identity needed for retry.
+- Never confuse mailbox delivery with model consumption or application completion.
+- Never rely only on a transient notification for wake-up or drop active work recovery after acknowledgement.
 
 ## How to reuse the library in another harness
 

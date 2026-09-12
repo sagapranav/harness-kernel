@@ -23,24 +23,37 @@ same session. Cross-session relationships live in event data.
 
 ## Core event types
 
-| Event                    | Category | Context | Purpose                                                         |
-| ------------------------ | -------- | ------: | --------------------------------------------------------------- |
-| `session.started`        | control  |      no | Records the session descriptor (its config is referenced by ID) |
-| `message.appended`       | context  |     yes | Adds a canonical observation                                    |
-| `context.compacted`      | context  |     yes | Replaces covered messages in the working view                   |
-| `model.call.started`     | trace    |      no | Records config reference, provider, and context boundary        |
-| `model.call.completed`   | trace    |      no | Records usage, termination, latency and errors                  |
-| `model.call.interrupted` | trace    |      no | Marks a crash window in which the model response was lost       |
-| `model.protocol.error`   | trace    |      no | Records a normalized response that violated the protocol        |
-| `action.started`         | trace    |      no | Records invocation, authority and idempotency                   |
-| `action.completed`       | trace    |      no | Records the side-effect receipt                                 |
-| `child.started`          | trace    |      no | Relates parent, child and immutable fork event                  |
-| `child.completed`        | context  |     yes | Returns conclusion and evidence to the parent                   |
-| `run.completed`          | control  |      no | Records the loop outcome                                        |
+| Event                      | Category | Context | Purpose                                                              |
+| -------------------------- | -------- | ------: | -------------------------------------------------------------------- |
+| `session.started`          | control  |      no | Records the session descriptor (its config is referenced by ID)      |
+| `message.appended`         | context  |     yes | Adds a canonical observation                                         |
+| `context.compacted`        | context  |     yes | Replaces covered messages in the working view                        |
+| `model.call.started`       | trace    |      no | Records config reference, provider, and context boundary             |
+| `model.call.completed`     | trace    |      no | Records usage, termination, latency and errors                       |
+| `model.call.interrupted`   | trace    |      no | Marks a crash window in which the model response was lost            |
+| `model.protocol.error`     | trace    |      no | Records a normalized response that violated the protocol             |
+| `action.started`           | trace    |      no | Records invocation, authority and idempotency                        |
+| `action.completed`         | trace    |      no | Records the side-effect receipt                                      |
+| `child.started`            | trace    |      no | Relates parent, child and immutable fork event                       |
+| `child.completed`          | context  |     yes | Returns conclusion and evidence to the parent                        |
+| `mailbox.message.received` | context  |     yes | Attributed inter-session observation and immutable delivery envelope |
+| `run.completed`            | control  |      no | Records the loop outcome                                             |
 
 The canonical names are exported as `EVENT_TYPES`. Applications may append
 namespaced types. Unknown types must survive storage round trips and be
 ignored by projections that do not understand them.
+
+## Mailbox delivery
+
+`mailbox.message.received` contains `data.mailboxMessage` (the immutable envelope)
+and `data.message` (the canonical user observation). The recipient loop appends
+it between turns and only then acknowledges the mailbox. Its message ID remains
+in raw history so retries cannot duplicate context after a lost acknowledgement
+or compaction. Delivery does not prove model consumption.
+
+A `child_result` envelope instead appends `child.completed` with the same mailbox
+envelope plus the existing `result` and `message` fields. Identical already-recorded
+child conclusions are reused; conflicting final results fail. See [MAILBOX.md](MAILBOX.md).
 
 ## Compaction
 

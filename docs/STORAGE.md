@@ -171,6 +171,21 @@ determinism is required.
 Runtime services must not contain secrets and must not silently weaken SHA-256
 content addressing.
 
+## Mailbox persistence
+
+`MailboxStore` is a separate operational port with its own
+`StorageComponentProfile`; existing `HarnessStorage` bundles do not change.
+`MemoryMailboxStore` is ephemeral. `FileMailboxStore` from `/node` is a durable,
+single-instance reference using flushed atomic snapshot replacement. It is not
+a distributed database and requires persistent filesystem storage.
+
+The portable handoff does not assume a transaction spanning mailbox and journal:
+append the recipient observation first, then acknowledge; recover a lost ack by
+matching the immutable envelope in raw journal history. Database adapters may
+supply stronger shared-transaction integration, but separately awaited port calls
+are not atomic. Run `checkMailboxStore()` and read [MAILBOX.md](MAILBOX.md) for
+storage semantics, acknowledgement trust, crash windows, and wake recovery.
+
 ## Operational execution state
 
 The work queue is intentionally not a fifth `HarnessStorage` port. Queue

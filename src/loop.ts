@@ -1,6 +1,7 @@
 import { assertArtifactRef } from "./artifacts.js";
 import { assertJsonSerializable } from "./json.js";
 import type { JournalStore } from "./journal.js";
+import { receiveMailbox, type MailboxStore } from "./mailbox.js";
 import { EVENT_TYPES, messageEvent, projectContext } from "./projection.js";
 import { defaultRuntime, type RuntimeServices } from "./runtime.js";
 import type {
@@ -50,6 +51,10 @@ export interface AgentLoopOptions {
   journal: JournalStore;
   model: ModelInvoker;
   actions: ActionExecutor;
+  /** Recipient-owned delivery at turn boundaries; senders only write the mailbox. */
+  mailbox?: MailboxStore;
+  /** Maximum pending observations incorporated per boundary. Default 100. */
+  maxMailboxMessagesPerTurn?: number;
   signal?: AbortSignal;
   maxTurns?: number;
   /** Host hook for renewing queue/session leases before every bounded turn. */
@@ -724,7 +729,7 @@ function inspectModelCallState(segment: JournalEvent[]): ModelCallState {
         state.assistantAfterLastCompleted = null;
         state.contextMessageAfterAssistant = false;
       }
-    } else if (event.type === EVENT_TYPES.messageAppended) {
+    } else if (event.affectsContext) {
       const message =
         typeof data.message === "object" && data.message !== null
           ? (data.message as CanonicalMessage)
@@ -903,6 +908,15 @@ export async function runAgentLoop(
   if (!Number.isSafeInteger(limit) || limit < 0) {
     throw new TypeError("maxTurns must be a non-negative safe integer");
   }
+  if (
+    options.maxMailboxMessagesPerTurn !== undefined &&
+    (!Number.isSafeInteger(options.maxMailboxMessagesPerTurn) ||
+      options.maxMailboxMessagesPerTurn < 1)
+  ) {
+    throw new TypeError(
+      "maxMailboxMessagesPerTurn must be a positive safe integer",
+    );
+  }
   let turns = 0;
   const priorEvents = await options.journal.read(options.sessionId);
   const appender = new SessionAppender(
@@ -910,13 +924,39 @@ export async function runAgentLoop(
     options.sessionId,
     priorEvents.at(-1)?.id ?? null,
   );
+  const receive = async (): Promise<number> => {
+    if (options.mailbox === undefined) return 0;
+    const result = await receiveMailbox({
+      sessionId: options.sessionId,
+      mailbox: options.mailbox,
+      journal: options.journal,
+      maxMessages: options.maxMailboxMessagesPerTurn,
+      append: (input) => appender.append(input),
+    });
+    return result.appended;
+  };
   const recovered = await recoverCrashBoundary(
     options,
     runtime,
     appender,
     priorEvents,
   );
-  if (recovered !== null) return recovered;
+  if (recovered !== null) {
+    // A recovered final outcome closes the old run, but pending observations
+    // can still start a new decision segment in this invocation.
+    if (
+      recovered.status !== "completed" ||
+      options.mailbox === undefined ||
+      (
+        await options.mailbox.read(options.sessionId, {
+          status: "pending",
+          limit: 1,
+        })
+      ).length === 0
+    ) {
+      return recovered;
+    }
+  }
 
   while (turns < limit) {
     if (options.signal?.aborted === true) {
@@ -934,6 +974,7 @@ export async function runAgentLoop(
       });
     }
     await options.beforeTurn?.();
+    await receive();
 
     turns += 1;
     const turnId = runtime.createId("turn");
@@ -1061,6 +1102,10 @@ export async function runAgentLoop(
 
     const calls = toolCalls(response.message);
     if (calls.length === 0) {
+      // A final answer may have raced incoming mail. Save both observations,
+      // then let the next turn consider the mail within this run's turn budget.
+      if (response.telemetry.stopReason === "end" && (await receive()) > 0)
+        continue;
       return appendOutcome(
         appender,
         outcomeForFinalStop(response.telemetry.stopReason, turns),

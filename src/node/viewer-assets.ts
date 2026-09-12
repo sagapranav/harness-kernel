@@ -269,7 +269,7 @@ export const VIEWER_CLIENT_JS = [
   "    var sum=el('summary',null,[ chev(), el('span',{class:'rn '+role,text: role==='tool'?'Tool':cap(role)}) ]); if(chip) sum.appendChild(chip);",
   "    det.appendChild(sum); det.appendChild(el('div',{class:'mb'}, bodyNodes)); return det; }",
   "  for(var i=0;i<session.events.length;i++){ var e=session.events[i]; var d=rec(e.data);",
-  "    if(e.type==='message.appended'){ var msg=rec(d.message); var role=msg.role||'user';",
+  "    if(e.type==='message.appended'||e.type==='mailbox.message.received'){ var msg=rec(d.message); var role=msg.role||'user';",
   "      if(role==='tool'){ var rem=(msg.content||[]).filter(function(b){ return !(b&&b.type==='tool_result'&&used[b.toolCallId]); }); if(!rem.length) continue; any=true; reading.appendChild(msgDetails('tool', null, contentBlocks(rem))); continue; }",
   "      any=true; var chip=(role==='assistant'&&e.turnId&&tt[e.turnId])? telemetryChip(tt[e.turnId]) : null;",
   "      var nodes=[]; var blocks=Array.isArray(msg.content)?msg.content:[];",

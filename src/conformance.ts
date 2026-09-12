@@ -15,6 +15,11 @@ import { defaultRuntime, type RuntimeServices } from "./runtime.js";
 import type { SessionCatalog } from "./sessions.js";
 import type { HarnessStorage } from "./storage.js";
 import {
+  MailboxConflictError,
+  type MailboxMessage,
+  type MailboxStore,
+} from "./mailbox.js";
+import {
   WorkItemConflictError,
   WorkLeaseConflictError,
   type WorkItem,
@@ -30,7 +35,8 @@ export interface ConformanceCheck {
     | "projections"
     | "sessions"
     | "work"
-    | "execution";
+    | "execution"
+    | "mailbox";
   name: string;
   passed: boolean;
   error?: string;
@@ -815,6 +821,7 @@ export interface CheckOrchestrationOptions {
   adapter: string;
   queue: WorkQueue;
   journal?: FencedJournalStore;
+  mailbox?: MailboxStore;
   runtime?: RuntimeServices;
 }
 
@@ -830,11 +837,255 @@ export async function checkOrchestration(
   if (options.journal !== undefined) {
     checks.push(...(await checkFencedJournalStore(options.journal, runtime)));
   }
+  if (options.mailbox !== undefined) {
+    checks.push(...(await checkMailboxStore(options.mailbox, runtime)));
+  }
   return {
     adapter: options.adapter,
     passed: checks.every((item) => item.passed),
     checks,
   };
+}
+
+/** Qualifies immutable send, ordered reads, recipient isolation, and acknowledgement. */
+export async function checkMailboxStore(
+  mailbox: MailboxStore,
+  runtime: RuntimeServices = defaultRuntime,
+): Promise<ConformanceCheck[]> {
+  const checks: ConformanceCheck[] = [];
+  const prefix = runtime.createId("mailbox_conformance");
+  const recipient = `${prefix}_recipient`;
+  const first: MailboxMessage = {
+    id: `${prefix}_first`,
+    senderSessionId: `${prefix}_sender`,
+    recipientSessionId: recipient,
+    createdAt: runtime.nowIso(),
+    body: { type: "message", content: [{ type: "text", text: "original" }] },
+  };
+  await check(checks, "mailbox", "profile is explicit", () => {
+    requireCondition(
+      mailbox.profile.adapter.length > 0,
+      "mailbox adapter is empty",
+    );
+    requireCondition(
+      ["ephemeral", "durable"].includes(mailbox.profile.durability),
+      "invalid mailbox durability",
+    );
+    requireCondition(
+      [
+        "single_instance",
+        "single_process",
+        "multi_process",
+        "distributed",
+      ].includes(mailbox.profile.coordination),
+      "invalid mailbox coordination",
+    );
+  });
+  await check(
+    checks,
+    "mailbox",
+    "send snapshots inputs and is atomically idempotent",
+    async () => {
+      const mutable = structuredMail(first);
+      const pending = mailbox.send(mutable);
+      mutable.body = {
+        type: "message",
+        content: [{ type: "text", text: "changed" }],
+      };
+      const saved = await pending;
+      requireCondition(
+        JSON.stringify(saved.message.body) === JSON.stringify(first.body),
+        "send retained caller mutation",
+      );
+      const repeated = await Promise.all([
+        mailbox.send(first),
+        mailbox.send(first),
+      ]);
+      requireCondition(
+        repeated.every(
+          (r) =>
+            r.sequence === saved.sequence && r.acceptedAt === saved.acceptedAt,
+        ),
+        "duplicate send changed acceptance identity",
+      );
+      let conflict: unknown;
+      try {
+        await mailbox.send({
+          ...first,
+          recipientSessionId: `${recipient}_different`,
+        });
+      } catch (error) {
+        conflict = error;
+      }
+      requireCondition(
+        conflict instanceof MailboxConflictError,
+        "conflicting send was accepted",
+      );
+      requireCondition(
+        (await mailbox.read(recipient)).length === 1,
+        "duplicate send created another record",
+      );
+      const fresh: MailboxMessage = { ...first, id: `${prefix}_raced` };
+      const raced = await Promise.all([
+        mailbox.send(fresh),
+        mailbox.send(fresh),
+      ]);
+      requireCondition(
+        raced[0]!.sequence === raced[1]!.sequence,
+        "concurrent first send duplicated mail",
+      );
+    },
+  );
+  await check(
+    checks,
+    "mailbox",
+    "reads isolate recipients and preserve acceptance order",
+    async () => {
+      const second = await mailbox.send({
+        ...first,
+        id: `${prefix}_second`,
+        createdAt: "2000-01-01T00:00:00.000Z",
+      });
+      await mailbox.send({
+        ...first,
+        id: `${prefix}_other`,
+        recipientSessionId: `${recipient}_other`,
+      });
+      const records = await mailbox.read(recipient);
+      requireCondition(
+        records.length === 3 &&
+          records.at(-1)?.message.id === second.message.id,
+        "recipient reads lost mail, leaked mail, or sorted by timestamps",
+      );
+      requireCondition(
+        records.every(
+          (r, i) => i === 0 || r.sequence > records[i - 1]!.sequence,
+        ),
+        "mail sequences are not increasing",
+      );
+      const page = await mailbox.read(recipient, {
+        afterSequence: records[0]!.sequence,
+        limit: 1,
+      });
+      requireCondition(
+        page.length === 1 && page[0]!.sequence === records[1]!.sequence,
+        "mail cursor/limit ignored",
+      );
+      records[0]!.message.senderSessionId = "mutated";
+      requireCondition(
+        (await mailbox.get(first.id))?.message.senderSessionId ===
+          first.senderSessionId,
+        "read exposed mutable state",
+      );
+      const loaded = await mailbox.get(first.id);
+      requireCondition(loaded !== null, "sent message absent");
+      loaded.message.senderSessionId = "mutated";
+      requireCondition(
+        (await mailbox.get(first.id))?.message.senderSessionId ===
+          first.senderSessionId,
+        "get exposed mutable state",
+      );
+      requireCondition(
+        (await mailbox.get(`${prefix}_missing`)) === null,
+        "missing get is not null",
+      );
+    },
+  );
+  await check(
+    checks,
+    "mailbox",
+    "acknowledgements are correlated, immutable and retryable",
+    async () => {
+      const delivery = {
+        sessionId: recipient,
+        eventId: `${prefix}_event`,
+        sequence: 1,
+        deliveredAt: runtime.nowIso(),
+      };
+      let wrong: unknown;
+      try {
+        await mailbox.acknowledge(first.id, {
+          ...delivery,
+          sessionId: "wrong",
+        });
+      } catch (error) {
+        wrong = error;
+      }
+      requireCondition(
+        wrong instanceof MailboxConflictError,
+        "wrong recipient acknowledged mail",
+      );
+      const mutable = { ...delivery };
+      const pending = mailbox.acknowledge(first.id, mutable);
+      mutable.eventId = "mutated";
+      await pending;
+      await mailbox.acknowledge(first.id, delivery);
+      const saved = await mailbox.get(first.id);
+      requireCondition(
+        saved?.status === "delivered" &&
+          saved.delivery?.eventId === delivery.eventId,
+        "acknowledgement was not snapshotted or persisted",
+      );
+      let conflict: unknown;
+      try {
+        await mailbox.acknowledge(first.id, {
+          ...delivery,
+          eventId: "different",
+        });
+      } catch (error) {
+        conflict = error;
+      }
+      requireCondition(
+        conflict instanceof MailboxConflictError,
+        "conflicting acknowledgement was accepted",
+      );
+      requireCondition(
+        (await mailbox.send(first)).status === "delivered",
+        "resend reopened delivered mail",
+      );
+      requireCondition(
+        !(await mailbox.read(recipient, { status: "pending" })).some(
+          (r) => r.message.id === first.id,
+        ),
+        "delivered mail still pending",
+      );
+      requireCondition(
+        (await mailbox.read(recipient, { status: "delivered" })).length === 1,
+        "delivered filter ignored",
+      );
+    },
+  );
+  await check(
+    checks,
+    "mailbox",
+    "pending recipients are recoverable without notifications",
+    async () => {
+      const only = `${prefix}_only`;
+      const msg = { ...first, id: only, recipientSessionId: only };
+      await mailbox.send(msg);
+      const recipients = await mailbox.pendingRecipients();
+      requireCondition(
+        recipients.includes(only) &&
+          new Set(recipients).size === recipients.length,
+        "pending recipient recovery failed",
+      );
+      await mailbox.acknowledge(only, {
+        sessionId: only,
+        eventId: `${only}_event`,
+        sequence: 1,
+        deliveredAt: runtime.nowIso(),
+      });
+      requireCondition(
+        !(await mailbox.pendingRecipients()).includes(only),
+        "delivered-only recipient remains pending",
+      );
+    },
+  );
+  return checks;
+}
+
+function structuredMail(message: MailboxMessage): MailboxMessage {
+  return JSON.parse(JSON.stringify(message)) as MailboxMessage;
 }
 
 /**

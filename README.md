@@ -17,6 +17,8 @@ agents, scheduled agents, and deterministic multi-agent workflows:
 - a provider-neutral work queue, worker host, continuations, retries, and DLQ
   semantics;
 - fenced single-writer execution leases for distributed session journals;
+- bidirectional session mailboxes with recipient-owned delivery, crash-safe
+  acknowledgement, bounded waiting, and memory/filesystem adapters;
 - action receipts, idempotency, evidence, and explicit absence semantics;
 - crash-boundary recovery: interrupted actions reconcile against external
   postconditions, lost model responses are marked and re-invoked, and lost
@@ -153,6 +155,8 @@ node dist/examples/basic-agent.js
   tools together: the manager's `spawn_agent` tool forks a capability-routed
   child worker on a different provider, the child runs its own tool, and its
   conclusion returns to the manager as one model-visible observation;
+- [`examples/mailbox-handoff.ts`](examples/mailbox-handoff.ts) — parent notes,
+  parallel children, final findings, and persisted bidirectional delivery;
 - [`examples/durable-worker.ts`](examples/durable-worker.ts) — the full
   durable composition: queue delivery, fenced session lease, lease renewal,
   deadline checkpoint, and a continuation finishing the run;
@@ -178,6 +182,7 @@ node dist/examples/basic-agent.js
 | `…/projection`                        | Context folds, compaction events and cold projections      |
 | `…/providers`                         | OpenAI/Anthropic normalization and outbound encoding       |
 | `…/loop`                              | The flat model → tools → model loop                        |
+| `…/mailbox`                           | Session mail, recipient delivery, waiting, and recovery    |
 | `…/work`                              | Work queue, leases, retries, continuations and worker host |
 | `…/orchestration`                     | Idempotent session and child-run dispatch                  |
 | `…/runtime`                           | Injectable identity, time, and SHA-256 host services       |
@@ -188,6 +193,30 @@ node dist/examples/basic-agent.js
 
 The root import re-exports the portable public API. Node adapters are only
 available from the explicit `/node` subpath.
+
+## Session mailboxes
+
+A parent can send notes while children work, and children can return findings
+while the parent runs. Senders write a `MailboxStore`; each recipient loop
+incorporates pending observations through its own journal writer between turns.
+
+```ts
+import { MemoryMailboxStore, runAgentLoop } from "@sagapranav/harness-kernel";
+
+const mailbox = new MemoryMailboxStore();
+// Pass this same store to the communicating sessions' runAgentLoop calls.
+// Supply the normal sessionId, config, journal, model, and actions options too.
+await runAgentLoop({ ...options, mailbox });
+```
+
+Use `FileMailboxStore` from `/node` for durable local delivery, or implement the
+portable interface for a database. Delivery appends before acknowledging and
+recovers lost acknowledgements from raw history without duplicate context.
+`waitForMailbox()` waits for pending observations; `pendingRecipients()` supports
+host wake recovery. Scheduling, authorization, durable wait conditions, and
+urgent interruption remain host responsibilities. **Delivered means journaled,
+not necessarily read or acted upon.** Read [docs/MAILBOX.md](docs/MAILBOX.md) for
+the complete handoff contract, crash cases, and integration checklist.
 
 ## Transcript viewer
 

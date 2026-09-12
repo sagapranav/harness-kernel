@@ -132,6 +132,29 @@ deterministic work ID. Cross-system atomicity remains an application concern;
 durable APIs should use a transactional outbox when session creation and queue
 submission use different systems.
 
+## Session communication
+
+`MailboxStore` is an execution-plane port, independent of the four semantic
+storage ports. Immutable messages have sender/recipient session IDs and a stable
+retry identity. Acceptance order and delivery receipts are mailbox state; the
+recipient journal becomes authoritative for incorporated observations.
+
+The agent loop receives bounded batches after crash repair and lease renewal,
+using its existing expected-head writer. It never lets a sender directly append
+to an active recipient journal. Parent notes and child findings use the same
+transport; final findings preserve `child.completed` semantics.
+
+The default handoff is append-before-ack across independent stores. Raw delivery
+identity closes a crash between those writes, including after compaction. A
+shared transaction is not assumed. Memory and filesystem adapters are references;
+mailbox profiles and conformance checks describe their operational contract.
+
+Bounded `waitForMailbox()` polls pending mail without making model calls. Durable
+wait predicates, wake coalescing, worker scheduling, authorization, retention,
+and urgent interruption remain host policy. Pending-recipient scans recover
+missed notifications; after journal delivery, the queue/host must still recover
+an interrupted execution. See [docs/MAILBOX.md](docs/MAILBOX.md).
+
 ## Forks
 
 A child session contains:

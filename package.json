@@ -1,6 +1,6 @@
 {
   "name": "@sagapranav/harness-kernel",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Provider-neutral, append-only primitives for building durable agent harnesses.",
   "type": "module",
   "license": "MIT",
@@ -76,6 +76,10 @@
     "./node": {
       "types": "./dist/src/node.d.ts",
       "import": "./dist/src/node.js"
+    },
+    "./mailbox": {
+      "types": "./dist/src/mailbox.d.ts",
+      "import": "./dist/src/mailbox.js"
     }
   },
   "files": [

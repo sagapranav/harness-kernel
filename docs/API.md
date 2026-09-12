@@ -47,6 +47,7 @@ signatures live in the shipped source and `.d.ts` files.
 
 - `checkHarnessStorage(storage, runtime?)` / `assertStorageConformance` — full storage-bundle suite.
 - `checkOrchestration({adapter, queue, journal?, runtime?})` / `assertOrchestrationConformance` — queue + fenced-journal suite (pass the `FencedJournalStore` itself; the expiry check needs an advancing clock).
+- `checkMailboxStore(mailbox, runtime?)` — mailbox profile, atomic/idempotent send, ordered isolated reads, immutable acknowledgements, and pending-recipient recovery; also available through `checkOrchestration({ mailbox, ... })`.
 - `checkJournalStore`, `checkArtifactStore`, `checkProjectionStore`, `checkSessionCatalog`, `checkWorkQueue`, `checkFencedJournalStore`, `checkRuntimeServices` — per-port checks.
 - `ConformanceCheck`, `StorageConformanceReport`, `OrchestrationConformanceReport`, `StorageConformanceError`, `OrchestrationConformanceError`, `CheckOrchestrationOptions` — report shapes.
 
@@ -87,10 +88,23 @@ signatures live in the shipped source and `.d.ts` files.
 ## `…/loop` — the provider-neutral agent loop
 
 - `runAgentLoop(options)` — repair crash boundaries, then model → tools → model with compare-and-append writes; throws `JournalConflictError` on a foreign write.
+- Mailbox loop options: `mailbox`, `maxMailboxMessagesPerTurn` (default 100); messages enter through the loop writer at turn boundaries.
 - `AgentLoopOptions` — `sessionId`, `config`, `journal`, `model`, `actions`, plus hooks: `maxTurns` (default 100), `signal`, `beforeTurn`, `shouldCheckpoint`, `project`, `runtime`, `reconcileAction`, `modelRetryDelayMs`, `onModelStream`.
 - `ModelInvoker`, `ModelRequest`, `ActionExecutor` — the injected policy and action surfaces; `ModelRequest.onStream` is the sink a streaming invoker forwards deltas to.
 - `inspectActionState(events)` / `ActionStateInspection` — crash-boundary inspection (`unstartedCalls`, `unresolved`, `missingResults`).
 - `appendActionReconciliation(journal, invocation, receipt)` — record a host-established terminal receipt outside the loop.
+
+## `…/mailbox` — session communication and handoff
+
+- `MailboxStore` — `send`, `get`, `read`, `acknowledge`, `pendingRecipients`; explicit per-adapter `profile`.
+- `MailboxMessage`, `MailboxContentBlock` — immutable attributed observations or final `ChildResult` envelopes.
+- `MailboxRecord`, `MailboxDelivery`, `MailboxReadOptions` — acceptance sequence, delivery state/receipt, and monitoring queries.
+- `MemoryMailboxStore`, `MailboxSnapshot` — ephemeral reference plus versioned snapshot/restore.
+- `MailboxConflictError` — changed envelope, wrong recipient, or conflicting delivery/result.
+- `assertMailboxMessage`, `assertMailboxDelivery`, `assertMailboxReadOptions`, `assertMailboxSnapshot` — adapter validation.
+- `mailboxEvent(message)` — raw context event; final child results use `child.completed`.
+- `receiveMailbox(options)` / `ReceiveMailboxOptions`, `MailboxReceiveResult` — recipient-owned append-before-ack delivery and raw-history deduplication.
+- `waitForMailbox(store, recipient, options?)` / `WaitForMailboxOptions`, `MailboxWaitResult` — bounded polling wait; `available` | `timeout` | `cancelled`; no acknowledgement or durable wait registration.
 
 ## `…/work` — queue, leases, worker host
 
@@ -130,6 +144,7 @@ signatures live in the shipped source and `.d.ts` files.
 
 - `createFileStorage(rootDirectory, runtime?)` — durable filesystem bundle.
 - `JsonlJournalStore` — one JSONL file per session; single instance per root; heals torn tails; O(1) cached appends.
+- `FileMailboxStore` — standalone durable local inbox; atomic synced snapshots, one writing instance per root, O(n) snapshot I/O.
 - `FileArtifactStore`, `FileProjectionStore`, `FileSessionCatalog` — filesystem ports.
 - `renderSessionViewer(storage, sessionId, options?)` — self-contained HTML transcript viewer (Overview / Transcript / Raw tabs, sub-agent navigation, inline images) for a session and its sub-agents.
 - `collectSessionBundle(storage, sessionId, options?)` / `ViewerBundle`, `ViewerSession`, `SessionViewerOptions` — the viewer's data as a plain object (sessions, telemetry, inlined images) for custom rendering.

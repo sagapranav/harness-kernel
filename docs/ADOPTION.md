@@ -63,6 +63,18 @@ kernel:
 Runtime-authored workflows should freeze the generated definition before
 execution and then use the same deterministic journal.
 
+## Add bidirectional agent communication
+
+Supply a `MailboxStore` separately from `HarnessStorage` and qualify it with
+`checkMailboxStore()`. Send immutable, stable-ID envelopes; pass the mailbox to
+each recipient's loop. Use ordinary messages for notes/progress and `child_result`
+for final conclusions. Delivery does not change the parent's fork inheritance.
+
+Retain active work recovery after acknowledgement, and use pending-recipient
+scans to recover missed wake-ups. Implement authorization and any durable
+wait-for-all policy in the host. The [mailbox handoff guide](MAILBOX.md) includes
+failure cases, duplicate handling, and an integration checklist.
+
 ## Add distributed child workers
 
 Persist the child descriptor before scheduling work. Use
@@ -75,8 +87,10 @@ continuations, and dead-lettering. Implement `FencedJournalStore` so a stale
 worker cannot append after ownership transfers. Run `checkOrchestration()`
 against isolated adapter namespaces.
 
-The returning worker writes its own journal and submits one `ChildResult` to the
-parent. Retry and continuation counters remain in queue state; the semantic
+The returning worker writes its own journal and sends one `ChildResult` through
+`MailboxStore` when the parent may still be running. Pass `mailbox` to the parent
+loop so its owner incorporates the result. Direct `completeChild()` is suitable
+only when the parent is not actively executing. Retry and continuation counters remain in queue state; the semantic
 journal retains model/action/run history.
 
 See [ORCHESTRATION.md](ORCHESTRATION.md) for single-CLI, serverless, and

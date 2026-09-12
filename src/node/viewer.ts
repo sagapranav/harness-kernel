@@ -81,7 +81,7 @@ function imageRefs(events: JournalEvent[]): ArtifactRef[] {
     }
   };
   for (const event of events) {
-    if (event.type !== EVENT_TYPES.messageAppended) continue;
+    if (!event.affectsContext) continue;
     walk(record(record(event.data).message).content);
   }
   return refs;

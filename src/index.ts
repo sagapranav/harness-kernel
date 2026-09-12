@@ -4,6 +4,7 @@ export * from "./execution.js";
 export * from "./json.js";
 export * from "./journal.js";
 export * from "./loop.js";
+export * from "./mailbox.js";
 export * from "./orchestration.js";
 export * from "./projection.js";
 export * from "./protocol.js";
